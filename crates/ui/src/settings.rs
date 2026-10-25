@@ -1,9 +1,12 @@
-//! Dashboard settings panel (§4.2), 1200 × 800 px, with two pages chosen by tabs in the header
-//! ("General" and "Resonance (experimental)", §5.1) and the modal resonance explanation card.
+//! Dashboard settings panel (§4.2), 1200 × 800 px, with three pages chosen by tabs in the header
+//! ("General", "Resonance (experimental)", §5.1, and "About & updates", §7.1) and the modal
+//! resonance explanation card.
 //!
 //! Coordinates passed to [`SettingsPanel::pointer_move`] and [`SettingsPanel::click`] are panel
 //! pixels with the origin at the **top-left** corner (OpenVR mouse events use a bottom-left
 //! origin; flip `y` before calling).
+
+use std::time::{Duration, Instant};
 
 use fvp_config::{Config, DisplayMode, MicMode, Placement, Preset, CUSTOM_MIN_GAP_HZ};
 use tiny_skia::{Color, Pixmap};
@@ -70,7 +73,46 @@ pub struct ResonanceLive {
     pub target: CalibStatus,
 }
 
-/// Live data shown in the panel (live strip, mic status line, autostart state, resonance).
+/// What the Updates section shows (§4.2, §7.1); the text is [`update_status_text`].
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum UpdateStatus {
+    /// No check result yet (automatic checks off, or the first one has not finished).
+    #[default]
+    NotChecked,
+    /// The last check found no newer release; minutes since that check.
+    UpToDate { checked_ago_min: u64 },
+    /// The last check found this newer version.
+    Available(String),
+    Checking,
+    /// The updater runs for this version (the service will restart the app).
+    Updating(String),
+    /// The updater runs and the app was started by hand, so the installer will stop it.
+    UpdatingManual,
+    /// Another updater unit was already active.
+    AlreadyRunning,
+    UpdateFailed(String),
+    CheckFailed(String),
+}
+
+impl UpdateStatus {
+    /// An updater is running: nothing may be started.
+    fn updating(&self) -> bool {
+        matches!(self, UpdateStatus::Updating(_) | UpdateStatus::UpdatingManual | UpdateStatus::AlreadyRunning)
+    }
+}
+
+/// Live state of the Updates section.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct UpdateLive {
+    /// The running version, `X.Y.Z`.
+    pub version: &'static str,
+    pub status: UpdateStatus,
+    /// Newer release offered by the "Update to X.Y.Z" button; `None` hides the button.
+    pub available: Option<String>,
+}
+
+/// Live data shown in the panel (live strip, mic status line, autostart state, resonance,
+/// updates).
 #[derive(Clone, PartialEq, Debug)]
 pub struct LiveInfo {
     pub f0_hz: Option<f32>,
@@ -80,6 +122,7 @@ pub struct LiveInfo {
     /// Whether the systemd user unit is enabled.
     pub autostart: bool,
     pub resonance: ResonanceLive,
+    pub update: UpdateLive,
 }
 
 /// Result of a click on a control.
@@ -93,6 +136,47 @@ pub enum Action {
     Quit,
     /// Start a 10 s calibration recording (§5.1).
     StartCalibration(CalibWhich),
+    /// "Check now": ask GitHub for the latest release, ignoring the cache (§7.1).
+    CheckUpdates,
+    /// "Update to X.Y.Z" confirmed by "Confirm update": install this version (`X.Y.Z`).
+    StartUpdate(String),
+}
+
+/// How long "Confirm update" waits for the second click (§4.2).
+pub const UPDATE_CONFIRM_WINDOW: Duration = Duration::from_secs(10);
+
+/// The two-step "Update to X.Y.Z" → "Confirm update" gate.
+#[derive(Clone, Debug, Default)]
+struct Confirm {
+    version: String,
+    /// End of the confirmation window; `None` = not armed.
+    until: Option<Instant>,
+}
+
+impl Confirm {
+    fn armed(&self, version: &str, now: Instant) -> bool {
+        self.until.is_some_and(|t| now < t) && self.version == version
+    }
+
+    /// First press arms the gate for [`UPDATE_CONFIRM_WINDOW`]; a second press for the same
+    /// version inside the window returns `true` and disarms it.
+    fn press(&mut self, version: &str, now: Instant) -> bool {
+        if self.armed(version, now) {
+            self.until = None;
+            return true;
+        }
+        self.version.clear();
+        self.version.push_str(version);
+        self.until = Some(now + UPDATE_CONFIRM_WINDOW);
+        false
+    }
+
+    /// Drops an elapsed window.
+    fn expire(&mut self, now: Instant) {
+        if self.until.is_some_and(|t| now >= t) {
+            self.until = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +206,11 @@ enum Control {
     MicMode(MicMode),
     Autostart(bool),
     Quit,
+    /// "Check now".
+    CheckUpdates,
+    /// "Update to X.Y.Z" / "Confirm update" (two-step, panel-internal until confirmed).
+    Update,
+    UpdateAuto(bool),
     /// Switch the panel page (panel-internal).
     Tab(Page),
     /// `true` opens the explanation card first; `false` turns resonance off directly.
@@ -140,6 +229,7 @@ enum Control {
 pub(crate) enum Page {
     General,
     Resonance,
+    Updates,
 }
 
 /// Which variant of the explanation card is open.
@@ -201,7 +291,9 @@ fn apply(control: Control, cfg: &Config, autostart: bool) -> Option<Action> {
         Control::Quit => return Some(Action::Quit),
         Control::Autostart(on) => return (on != autostart).then_some(Action::SetAutostart(on)),
         Control::Record(which) => return Some(Action::StartCalibration(which)),
-        Control::Tab(_) | Control::HowItWorks | Control::CardClose => return None,
+        Control::CheckUpdates => return Some(Action::CheckUpdates),
+        Control::Tab(_) | Control::HowItWorks | Control::CardClose | Control::Update => return None,
+        Control::UpdateAuto(on) => c.update.check = on,
         Control::ResonanceEnabled(on) => c.resonance.enabled = on,
         Control::CardTurnOn => c.resonance.enabled = true,
         Control::HudEnabled(on) => c.hud.enabled = on,
@@ -291,6 +383,14 @@ const CALIB_HINT_LINES: usize = 4;
 /// Length of a calibration recording (§5.1), for the "s left" readout.
 const CALIBRATION_S: f32 = 10.0;
 
+// Updates page.
+const UPD_STATUS_LINES: usize = 2;
+const UPD_STATUS_LINE_H: f32 = 30.0;
+const UPD_HINT_LINES: usize = 3;
+const UPD_HINT_LINE_H: f32 = 24.0;
+const ABOUT_NAME_H: f32 = 40.0;
+const ABOUT_LINE_H: f32 = 30.0;
+
 // Explanation card (modal over the whole panel).
 const CARD_R: R = R::new(150.0, 96.0, 900.0, 608.0);
 /// Scrollable text viewport inside the card.
@@ -329,6 +429,7 @@ const fn content_height(page: Page) -> f32 {
             (if left > right { left } else { right }) + PAD
         }
         Page::Resonance => resonance_card_h() + PAD,
+        Page::Updates => updates_card_h() + PAD,
     }
 }
 const fn hud_card_h() -> f32 {
@@ -357,6 +458,18 @@ const fn resonance_card_h() -> f32 {
         + RES_POS_LINES as f32 * RES_POS_LINE_H;
     let right = HEAD_H + 2.0 * (CALIB_BTN_H + 6.0 + CALIB_STATUS_H + 10.0)
         + CALIB_HINT_LINES as f32 * RES_INTRO_LINE_H;
+    (if left > right { left } else { right }) + CARD_BOTTOM_PAD
+}
+/// Both cards of the updates page share this height.
+const fn updates_card_h() -> f32 {
+    let left = HEAD_H
+        + ROW_H
+        + UPD_STATUS_LINES as f32 * UPD_STATUS_LINE_H
+        + 6.0
+        + 2.0 * ROW_H
+        + 6.0
+        + UPD_HINT_LINES as f32 * UPD_HINT_LINE_H;
+    let right = HEAD_H + ABOUT_NAME_H + 3.0 * ABOUT_LINE_H;
     (if left > right { left } else { right }) + CARD_BOTTOM_PAD
 }
 
@@ -401,6 +514,34 @@ fn position_text(view: Option<ResonanceView>) -> &'static str {
         Some(ResonanceView::Position(p)) if p < 0.75 => STRINGS.res_between,
         Some(ResonanceView::Position(p)) if p <= 1.1 => STRINGS.res_near_target,
         Some(ResonanceView::Position(_)) => STRINGS.res_beyond_target,
+    }
+}
+
+/// "2 h ago" etc. for the "Up to date" status line.
+fn ago_text(minutes: u64) -> String {
+    let s = STRINGS;
+    let (template, n) = match minutes {
+        0 => return s.upd_ago_now.to_string(),
+        1..=59 => (s.upd_ago_min, minutes),
+        60..=2879 => (s.upd_ago_h, minutes / 60),
+        _ => (s.upd_ago_d, minutes / (24 * 60)),
+    };
+    template.replace("{n}", &n.to_string())
+}
+
+/// The Updates status line (§4.2).
+pub fn update_status_text(status: &UpdateStatus) -> String {
+    let s = STRINGS;
+    match status {
+        UpdateStatus::NotChecked => s.upd_not_checked.to_string(),
+        UpdateStatus::UpToDate { checked_ago_min } => s.upd_up_to_date.replace("{ago}", &ago_text(*checked_ago_min)),
+        UpdateStatus::Available(v) => fill_v(s.upd_available, v),
+        UpdateStatus::Checking => s.upd_checking.to_string(),
+        UpdateStatus::Updating(v) => fill_v(s.upd_updating, v),
+        UpdateStatus::UpdatingManual => s.upd_updating_manual.to_string(),
+        UpdateStatus::AlreadyRunning => s.upd_already_running.to_string(),
+        UpdateStatus::UpdateFailed(reason) => s.upd_failed.replace("{reason}", reason),
+        UpdateStatus::CheckFailed(reason) => s.upd_check_failed.replace("{reason}", reason),
     }
 }
 
@@ -640,7 +781,7 @@ impl Ui<'_> {
 
 /// Builds (and draws) the whole panel. Body first, then the fixed header on top of it, then the
 /// modal explanation card, which alone receives the pointer while open.
-fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, view: ViewState) {
+fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, view: ViewState, armed: bool) {
     let pointer = ui.pointer;
     if view.card.is_some() {
         ui.pointer = None;
@@ -653,6 +794,7 @@ fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, view: ViewState) {
             body_right(ui, cfg, live);
         }
         Page::Resonance => resonance_page(ui, cfg, live),
+        Page::Updates => updates_page(ui, cfg, &live.update, armed),
     }
 
     ui.in_body = false;
@@ -673,11 +815,13 @@ fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, page: Page) {
     let quit = R::new(W - M - 170.0, 10.0, 170.0, 42.0);
     let hint = R::new(W - M - 320.0, 54.0, 320.0, 20.0);
     ui.text(R::new(M, 14.0, TABS_X - M - 16.0, 48.0), STRINGS.title, 32.0, Weight::SemiBold, TEXT, Align::Left);
+    // Three tabs end left of Quit and above its hint.
     ui.segmented(
-        R::new(TABS_X, 14.0, hint.x - 16.0 - TABS_X, 48.0),
+        R::new(TABS_X, 12.0, quit.x - 16.0 - TABS_X, quit.bottom() - 12.0),
         &[
             (STRINGS.tab_general, Control::Tab(Page::General), page == Page::General),
             (STRINGS.tab_resonance, Control::Tab(Page::Resonance), page == Page::Resonance),
+            (STRINGS.tab_updates, Control::Tab(Page::Updates), page == Page::Updates),
         ],
         true,
     );
@@ -950,6 +1094,64 @@ fn resonance_page(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     );
 }
 
+/// Updates page (§4.2, §7.1): version, status line, "Check now", "Update to X.Y.Z" /
+/// "Confirm update" and "Check automatically" on the left, about lines on the right.
+fn updates_page(ui: &mut Ui<'_>, cfg: &Config, upd: &UpdateLive, armed: bool) {
+    let h = updates_card_h();
+    let inner = COL_W - 2.0 * PAD;
+
+    let x = LEFT_X;
+    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_updates);
+    ui.row_label(x, y, STRINGS.upd_version, true);
+    ui.text(ctrl_rect(x, y), upd.version, 22.0, Weight::SemiBold, TEXT, Align::Left);
+    y += ROW_H;
+    let failed = matches!(upd.status, UpdateStatus::UpdateFailed(_) | UpdateStatus::CheckFailed(_));
+    let status_h = UPD_STATUS_LINES as f32 * UPD_STATUS_LINE_H;
+    ui.paragraph(
+        R::new(x + PAD, y, inner, status_h),
+        &update_status_text(&upd.status),
+        UPD_STATUS_LINES,
+        UPD_STATUS_LINE_H,
+        22.0,
+        Weight::SemiBold,
+        if failed { WARN } else { TEXT },
+    );
+    y += status_h + 6.0;
+    let updating = upd.status.updating();
+    let busy = updating || upd.status == UpdateStatus::Checking;
+    let half = (inner - 12.0) / 2.0;
+    let by = y + (ROW_H - CTRL_H) / 2.0;
+    ui.button(R::new(x + PAD, by, half, CTRL_H), STRINGS.upd_check_now, Control::CheckUpdates, !busy, false);
+    if let Some(version) = &upd.available {
+        let label = if armed { STRINGS.upd_confirm.to_string() } else { fill_v(STRINGS.upd_update_to, version) };
+        let r = R::new(x + PAD + half + 12.0, by, half, CTRL_H);
+        ui.button(r, &label, Control::Update, !updating, armed);
+    }
+    y += ROW_H;
+    ui.row_label(x, y, STRINGS.upd_auto, true);
+    ui.on_off(ctrl_rect(x, y), cfg.update.check, Control::UpdateAuto);
+    y += ROW_H + 6.0;
+    ui.paragraph(
+        R::new(x + PAD, y, inner, UPD_HINT_LINES as f32 * UPD_HINT_LINE_H),
+        STRINGS.upd_hint,
+        UPD_HINT_LINES,
+        UPD_HINT_LINE_H,
+        18.0,
+        Weight::Regular,
+        TEXT_DIM,
+    );
+
+    let x = RIGHT_X;
+    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_about);
+    let name = fill_v(STRINGS.about_name, upd.version);
+    ui.text(R::new(x + PAD, y, inner, ABOUT_NAME_H), &name, 24.0, Weight::SemiBold, TEXT, Align::Left);
+    y += ABOUT_NAME_H;
+    for line in STRINGS.about_lines {
+        ui.text(R::new(x + PAD, y, inner, ABOUT_LINE_H), line, 19.0, Weight::Regular, TEXT_DIM, Align::Left);
+        y += ABOUT_LINE_H;
+    }
+}
+
 /// Progress bar while recording, else the result, failure message or "not recorded".
 fn calib_status(ui: &mut Ui<'_>, r: R, status: &CalibStatus, stored: Option<f32>, on: bool) {
     let fade = |c: Rgba| if on { c } else { c.with_alpha(DISABLED_ALPHA + 40) };
@@ -1099,6 +1301,8 @@ struct RenderKey {
     live: LiveKey,
     hover: Option<usize>,
     view: ViewState,
+    /// "Confirm update" is showing.
+    armed: bool,
 }
 
 /// The dashboard settings panel.
@@ -1117,6 +1321,10 @@ pub struct SettingsPanel {
     last_status: String,
     /// Failure messages (relaxed, target) the pixels currently show.
     last_failures: [String; 2],
+    /// Update state the pixels currently show; its `available` version is what "Update to"
+    /// installs.
+    last_update: UpdateLive,
+    confirm: Confirm,
     dirty: bool,
 }
 
@@ -1141,6 +1349,8 @@ impl SettingsPanel {
             last: None,
             last_status: String::new(),
             last_failures: [String::new(), String::new()],
+            last_update: UpdateLive::default(),
+            confirm: Confirm::default(),
             dirty: true,
         }
     }
@@ -1153,14 +1363,21 @@ impl SettingsPanel {
 
     /// Renders the panel; `None` when the pixels would not change.
     pub fn render(&mut self, cfg: &Config, live: &LiveInfo) -> Option<Frame<'_>> {
-        let key = RenderKey { live: LiveKey::of(live), hover: self.hover, view: self.view };
+        let now = Instant::now();
+        self.confirm.expire(now);
+        if live.update.status.updating() {
+            self.confirm.until = None;
+        }
+        let armed = live.update.available.as_deref().is_some_and(|v| self.confirm.armed(v, now));
+        let key = RenderKey { live: LiveKey::of(live), hover: self.hover, view: self.view, armed };
         let failures = [failure_message(&live.resonance.relaxed), failure_message(&live.resonance.target)];
         let unchanged = !self.dirty
             && self.cfg.as_ref() == Some(cfg)
             && self.last.as_ref() == Some(&key)
             && self.last_status == live.mic_status_line
             && self.last_failures[0] == failures[0]
-            && self.last_failures[1] == failures[1];
+            && self.last_failures[1] == failures[1]
+            && self.last_update == live.update;
         if unchanged {
             return None;
         }
@@ -1178,6 +1395,9 @@ impl SettingsPanel {
         if self.cfg.as_ref() != Some(cfg) {
             self.cfg = Some(cfg.clone());
         }
+        if self.last_update != live.update {
+            self.last_update.clone_from(&live.update);
+        }
         self.autostart = live.autostart;
 
         self.pixmap.fill(Color::from_rgba8(BG.r, BG.g, BG.b, 255));
@@ -1191,7 +1411,7 @@ impl SettingsPanel {
             dy: 0.0,
             in_body: true,
         };
-        build(&mut ui, cfg, live, self.view);
+        build(&mut ui, cfg, live, self.view, armed);
         // The layout may have moved under a resting pointer (page or card change).
         self.hover = self.pointer.and_then(|(x, y)| self.hit(x, y));
         self.last = Some(RenderKey { hover: self.hover, ..key });
@@ -1224,7 +1444,8 @@ impl SettingsPanel {
     /// Click at panel pixel (x, y), top-left origin. Returns the action to perform; config edits
     /// are also applied to the panel's copy so rapid clicks accumulate before the next render.
     /// Turning resonance on opens the explanation card; only its "Turn on" yields the
-    /// [`Action::SetConfig`].
+    /// [`Action::SetConfig`]. "Update to X.Y.Z" only arms "Confirm update"; a second click within
+    /// [`UPDATE_CONFIRM_WINDOW`] yields [`Action::StartUpdate`].
     pub fn click(&mut self, x: f32, y: f32) -> Option<Action> {
         let control = self.widgets[self.hit(x, y)?].control;
         let resonance_on = self.cfg.as_ref()?.resonance.enabled;
@@ -1248,6 +1469,11 @@ impl SettingsPanel {
                 return None;
             }
             Control::CardTurnOn => self.set_view(ViewState { card: None, ..self.view }),
+            Control::Update => {
+                let version = self.last_update.available.clone()?;
+                self.dirty = true;
+                return self.confirm.press(&version, Instant::now()).then_some(Action::StartUpdate(version));
+            }
             _ => {}
         }
         let action = apply(control, self.cfg.as_ref()?, self.autostart)?;
@@ -1260,9 +1486,15 @@ impl SettingsPanel {
                 self.autostart = *on;
                 self.dirty = true;
             }
-            Action::Quit | Action::StartCalibration(_) => {}
+            Action::Quit | Action::StartCalibration(_) | Action::CheckUpdates | Action::StartUpdate(_) => {}
         }
         Some(action)
+    }
+
+    /// When the panel must be rendered again without any input: the end of the "Confirm update"
+    /// window, after which the button reverts to "Update to X.Y.Z".
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.confirm.until
     }
 
     /// Switches panel-internal view state. The old hit rectangles are dropped so that no click
@@ -1277,6 +1509,14 @@ impl SettingsPanel {
     /// Shows `page` with the card `card` (or none) at the top of its text; used by the previews.
     pub(crate) fn show(&mut self, page: Page, card: Option<Card>) {
         self.set_view(ViewState { page, card, scroll_px: 0.0, card_scroll_px: 0.0 });
+    }
+
+    /// Presses "Update to X.Y.Z" once (shows "Confirm update"); used by the previews.
+    pub(crate) fn arm_update(&mut self) {
+        if let Some(version) = self.last_update.available.clone() {
+            self.confirm.press(&version, Instant::now());
+            self.dirty = true;
+        }
     }
 
     fn open_card(&mut self, card: Card) {
@@ -1313,6 +1553,7 @@ mod tests {
             mic_status_line: "Bypass \u{00b7} recording from Internal Microphone".into(),
             autostart: false,
             resonance: ResonanceLive::default(),
+            update: UpdateLive::default(),
         }
     }
 
@@ -1424,9 +1665,9 @@ mod tests {
             let (x, y) = (w.rect.cx(), w.rect.cy());
             assert_eq!(panel.hit(x, y), Some(i), "{:?} overlaps another control", w.control);
         }
-        // 2 tabs, 17 HUD (2+3+2+2+2+6), 11 target (3+4+4), 8 reminder, 2 vocal rest, 2 mic,
+        // 3 tabs, 17 HUD (2+3+2+2+2+6), 11 target (3+4+4), 8 reminder, 2 vocal rest, 2 mic,
         // 2 autostart, quit.
-        assert_eq!(panel.widgets.len(), 45);
+        assert_eq!(panel.widgets.len(), 46);
     }
 
     #[test]
@@ -1570,7 +1811,7 @@ mod tests {
 
     #[test]
     fn layout_fits_without_scrolling() {
-        for page in [Page::General, Page::Resonance] {
+        for page in [Page::General, Page::Resonance, Page::Updates] {
             let h = content_height(page);
             assert!(h <= H - VIEW_TOP, "{page:?}: content {h} > viewport");
         }
@@ -1708,7 +1949,7 @@ mod tests {
 
     #[test]
     fn every_resonance_control_is_reachable_and_inside_the_viewport() {
-        let cases = [(on_cfg(), None, 8), (Config::default(), Some(Card::Enable), 2), (on_cfg(), Some(Card::Info), 1)];
+        let cases = [(on_cfg(), None, 9), (Config::default(), Some(Card::Enable), 2), (on_cfg(), Some(Card::Info), 1)];
         for (cfg, card, count) in cases {
             let mut panel = SettingsPanel::new();
             panel.show(Page::Resonance, card);
@@ -1813,5 +2054,143 @@ mod tests {
         assert_eq!(position_text(Some(ResonanceView::Uncalibrated)), STRINGS.res_uncalibrated);
         assert_eq!(position_text(Some(ResonanceView::TooSimilar)), STRINGS.res_too_similar);
         assert_eq!(position_text(Some(ResonanceView::NeedsBypass)), STRINGS.res_needs_bypass);
+    }
+
+    fn update_live(status: UpdateStatus, available: Option<&str>) -> LiveInfo {
+        LiveInfo {
+            update: UpdateLive { version: "0.2.1", status, available: available.map(str::to_string) },
+            ..live()
+        }
+    }
+
+    #[test]
+    fn update_status_lines_follow_spec_wording() {
+        let t = update_status_text;
+        assert_eq!(t(&UpdateStatus::UpToDate { checked_ago_min: 120 }), "Up to date \u{00b7} checked 2 h ago");
+        assert_eq!(t(&UpdateStatus::UpToDate { checked_ago_min: 0 }), "Up to date \u{00b7} checked just now");
+        assert_eq!(t(&UpdateStatus::UpToDate { checked_ago_min: 5 }), "Up to date \u{00b7} checked 5 min ago");
+        assert_eq!(t(&UpdateStatus::UpToDate { checked_ago_min: 3 * 24 * 60 }), "Up to date \u{00b7} checked 3 d ago");
+        assert_eq!(t(&UpdateStatus::Available("1.2.3".into())), "Version 1.2.3 is available");
+        assert_eq!(t(&UpdateStatus::Checking), "Checking\u{2026}");
+        assert_eq!(t(&UpdateStatus::Updating("1.2.3".into())), "Updating to 1.2.3\u{2026}");
+        assert_eq!(t(&UpdateStatus::UpdateFailed("no network".into())), "Update failed: no network");
+        assert_eq!(t(&UpdateStatus::CheckFailed("no network".into())), "Couldn't check: no network");
+        assert_eq!(t(&UpdateStatus::AlreadyRunning), "An update is already running");
+        assert_eq!(
+            t(&UpdateStatus::UpdatingManual),
+            "Updating\u{2026} the app will close; start it again from the + list"
+        );
+        assert_eq!(t(&UpdateStatus::NotChecked), STRINGS.upd_not_checked);
+    }
+
+    #[test]
+    fn confirm_gate_needs_a_second_press_within_10_s() {
+        let t0 = Instant::now();
+        let at = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        let mut c = Confirm::default();
+        assert!(!c.armed("0.3.0", t0));
+        assert!(!c.press("0.3.0", t0), "the first press only arms");
+        assert!(c.armed("0.3.0", at(9.9)));
+        assert!(!c.armed("0.4.0", at(1.0)), "armed for one version only");
+        assert!(c.press("0.3.0", at(9.9)));
+        assert!(!c.armed("0.3.0", at(9.9)), "confirming disarms");
+        // Too late: the second press arms again instead of confirming.
+        assert!(!c.press("0.3.0", t0));
+        assert!(!c.press("0.3.0", at(10.0)));
+        assert!(c.press("0.3.0", at(15.0)));
+        // A different version arms afresh.
+        assert!(!c.press("0.3.0", t0));
+        assert!(!c.press("0.4.0", at(1.0)));
+        assert!(c.press("0.4.0", at(2.0)));
+        assert!(!c.press("0.4.0", t0));
+        c.expire(at(9.0));
+        assert!(c.until.is_some());
+        c.expire(at(10.0));
+        assert_eq!(c.until, None);
+    }
+
+    #[test]
+    fn update_button_asks_for_confirmation_within_the_window() {
+        let cfg = Config::default();
+        let l = update_live(UpdateStatus::Available("0.3.0".into()), Some("0.3.0"));
+        let mut panel = panel_on(Page::Updates, &cfg, &l);
+        assert_eq!(panel.next_deadline(), None);
+        assert_eq!(click(&mut panel, Control::Update), None, "the first click only arms");
+        let deadline = panel.next_deadline().expect("armed");
+        assert!(deadline <= Instant::now() + UPDATE_CONFIRM_WINDOW);
+        assert!(panel.render(&cfg, &l).is_some(), "label changes to Confirm update");
+        assert!(panel.last.unwrap().armed);
+        assert_eq!(click(&mut panel, Control::Update), Some(Action::StartUpdate("0.3.0".into())));
+        assert_eq!(panel.next_deadline(), None);
+
+        // When the window ends the label reverts and the next click arms again.
+        panel.render(&cfg, &l).unwrap();
+        assert_eq!(click(&mut panel, Control::Update), None);
+        panel.confirm.until = Some(Instant::now());
+        assert!(panel.render(&cfg, &l).is_some(), "label reverts");
+        assert!(!panel.last.unwrap().armed);
+        assert_eq!(panel.next_deadline(), None);
+        assert_eq!(click(&mut panel, Control::Update), None, "arms again");
+
+        // A running update disarms.
+        let updating = update_live(UpdateStatus::Updating("0.3.0".into()), Some("0.3.0"));
+        assert!(panel.render(&cfg, &updating).is_some());
+        assert!(!panel.last.unwrap().armed);
+        assert_eq!(panel.next_deadline(), None);
+    }
+
+    #[test]
+    fn update_controls_hit_and_follow_the_state() {
+        let cfg = Config::default();
+        let mut panel = panel_on(Page::Updates, &cfg, &update_live(UpdateStatus::UpToDate { checked_ago_min: 3 }, None));
+        assert!(!controls(&panel).contains(&Control::Update), "no newer release, no button");
+        assert_eq!(click(&mut panel, Control::CheckUpdates), Some(Action::CheckUpdates));
+        let mut off = cfg.clone();
+        off.update.check = false;
+        assert_eq!(click(&mut panel, Control::UpdateAuto(false)), Some(Action::SetConfig(off)));
+        assert_eq!(click(&mut panel, Control::UpdateAuto(true)), Some(Action::SetConfig(cfg.clone())));
+
+        let cases = [
+            (UpdateStatus::Available("0.3.0".into()), true, true),
+            (UpdateStatus::Checking, false, true),
+            (UpdateStatus::Updating("0.3.0".into()), false, false),
+            (UpdateStatus::UpdatingManual, false, false),
+            (UpdateStatus::AlreadyRunning, false, false),
+            (UpdateStatus::UpdateFailed("x".into()), true, true),
+            (UpdateStatus::CheckFailed("x".into()), true, true),
+        ];
+        for (status, check, update) in cases {
+            let panel = panel_on(Page::Updates, &cfg, &update_live(status.clone(), Some("0.3.0")));
+            assert_eq!(is_enabled(&panel, Control::CheckUpdates), check, "{status:?}");
+            assert_eq!(is_enabled(&panel, Control::Update), update, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn every_update_control_is_reachable_and_inside_the_viewport() {
+        let l = update_live(UpdateStatus::Available("0.3.0".into()), Some("0.3.0"));
+        let panel = panel_on(Page::Updates, &Config::default(), &l);
+        // 3 tabs, quit, check now, update, 2 check automatically.
+        assert_eq!(panel.widgets.len(), 8);
+        for (i, w) in panel.widgets.iter().enumerate() {
+            let r = w.rect;
+            assert!(r.x >= 0.0 && r.right() <= W && r.y >= 0.0 && r.bottom() <= H, "{w:?}");
+            assert_eq!(panel.hit(r.cx(), r.cy()), Some(i), "{:?} overlaps another control", w.control);
+        }
+    }
+
+    #[test]
+    fn update_render_none_when_unchanged_some_on_changes() {
+        let cfg = Config::default();
+        let mut l = update_live(UpdateStatus::UpToDate { checked_ago_min: 3 }, None);
+        let mut panel = panel_on(Page::Updates, &cfg, &l);
+        assert!(panel.render(&cfg, &l).is_none());
+        l.update.status = UpdateStatus::UpToDate { checked_ago_min: 4 };
+        assert!(panel.render(&cfg, &l).is_some());
+        l.update.status = UpdateStatus::Checking;
+        assert!(panel.render(&cfg, &l).is_some());
+        assert!(panel.render(&cfg, &l).is_none());
+        l.update.available = Some("0.3.0".into());
+        assert!(panel.render(&cfg, &l).is_some());
     }
 }

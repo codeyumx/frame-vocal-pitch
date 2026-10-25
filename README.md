@@ -35,6 +35,7 @@ installs it into your home directory:
 | systemd user unit | `~/.config/systemd/user/frame-vocal-pitch.service` |
 | dashboard entry | `~/.local/share/applications/frame-vocal-pitch.desktop` |
 | icons | `~/.local/share/icons/hicolor/48x48/apps/frame-vocal-pitch.png` (also `128x128`, `256x256`) |
+| updater (a copy of the installer) | `~/.local/share/frame-vocal-pitch/install.sh` |
 | configuration | `~/.config/frame-vocal-pitch/config.toml` |
 
 It refuses to run as root, refuses to run on a non-aarch64 machine, and warns when the system does
@@ -49,6 +50,7 @@ url=https://github.com/codeyumx/frame-vocal-pitch/releases/latest/download/insta
 curl -fsSL "$url" | bash -s -- --autostart           # start with SteamVR
 curl -fsSL "$url" | bash -s -- --no-autostart        # do not start with SteamVR
 curl -fsSL "$url" | bash -s -- --version             # version that would be installed
+curl -fsSL "$url" | bash -s -- --release v0.3.0      # install that release instead of the latest
 curl -fsSL "$url" | bash -s -- --uninstall           # remove, keep the configuration
 curl -fsSL "$url" | bash -s -- --uninstall --purge   # remove, including the configuration
 ```
@@ -58,7 +60,47 @@ you can also flip it later in the dashboard.
 
 If you prefer not to pipe into a shell, download the tarball from the
 [releases page](https://github.com/codeyumx/frame-vocal-pitch/releases), extract it and run
-`./install.sh` from inside the extracted folder. It installs the payload next to it.
+`./install.sh` from inside the extracted folder. It installs the payload next to it (`--release`
+only works when the installer is piped or run on its own).
+
+## Updates
+
+The app checks for updates itself and installs one only when you ask for it, from the dashboard's
+**Updates** section. Nothing about updates is ever shown on the HUD.
+
+- **When it checks:** with **Check automatically** on (the default; `update.check` in
+  `config.toml`), at start and then every hour, but it asks GitHub at most once a day (an hour
+  after a failed check). **Check now** asks right away and works even with automatic checks off.
+  It asks only for the tag of the latest release
+  (`api.github.com/repos/codeyumx/frame-vocal-pitch/releases/latest`); the result is cached in
+  `~/.cache/frame-vocal-pitch/update-check.json`.
+- **What it installs:** after **Update to X.Y.Z** and a second click on **Confirm update**, it runs
+  `~/.local/share/frame-vocal-pitch/install.sh --release vX.Y.Z`. That downloads exactly that
+  release's tarball and `SHA256SUMS`, checks the checksum, and runs the release's own installer with
+  your saved options (`~/.config/frame-vocal-pitch/install-args`, so autostart stays as it was).
+  It is the same install you get from the one-line command, pinned to the version you confirmed.
+- **Where it runs:** in a separate systemd user unit, `frame-vocal-pitch-update`, so it survives the
+  app being restarted. Its output goes to `~/.cache/frame-vocal-pitch/update.log`. When the app
+  runs as a service, the update restarts it; if you started it by hand, the app closes and you
+  start it again from the dashboard's **+** list.
+- **When it fails:** nothing installed is touched until the download has been verified, so a
+  missing release, a broken download or a checksum mismatch leaves the current version installed
+  and running. The dashboard shows "Update failed:" followed by the last line of `update.log`.
+- **Checksum, not signature:** `SHA256SUMS` comes from the same GitHub release as the tarball. It
+  catches broken or truncated downloads; it does not protect against a release that was replaced
+  by someone with access to the repository.
+- **Versions up to 0.2.1** have no updater: re-run the install command once; later versions can
+  update from the dashboard.
+
+If an update fails or seems stuck:
+
+```sh
+cat ~/.cache/frame-vocal-pitch/update.log                       # what it did; reason on the last line
+systemctl --user status frame-vocal-pitch-update                # is an update still running?
+~/.local/share/frame-vocal-pitch/install.sh --release vX.Y.Z    # run the same update by hand
+```
+
+Re-running the one-line install command always works as well and installs the latest release.
 
 ## Using it
 
@@ -135,7 +177,8 @@ curl -fsSL https://github.com/codeyumx/frame-vocal-pitch/releases/latest/downloa
 ```
 
 That stops and disables the service, stops an instance you started by hand, and removes the
-binary, unit, dashboard entry and icons. `--uninstall --purge` removes
+binary, unit, dashboard entry, icons, the updater (`~/.local/share/frame-vocal-pitch/`) and the
+update cache and log (`~/.cache/frame-vocal-pitch/`). `--uninstall --purge` removes
 `~/.config/frame-vocal-pitch` as well. Nothing outside your home directory is removed.
 
 ## Build from source

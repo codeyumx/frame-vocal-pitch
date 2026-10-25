@@ -2,11 +2,12 @@
 //!
 //! Three threads: the PipeWire capture thread inside [`Capture`], the analysis
 //! thread from [`crate::analysis`], and this one, which owns every OpenVR and
-//! Vulkan object. The main loop blocks in one `poll()` whose timeout is the
-//! nearest deadline (SteamVR retry, config watch, capture status, controller
-//! re-resolve, HUD animation frame) and is woken early by signals or by the
-//! analysis thread. Nothing is rendered unless an overlay is visible and its
-//! renderer reports changed pixels.
+//! Vulkan object (update checks add a short-lived `curl` thread, §7.1). The main
+//! loop blocks in one `poll()` whose timeout is the nearest deadline (SteamVR
+//! retry, config watch, capture status, controller re-resolve, HUD animation
+//! frame, update schedule) and is woken early by signals, by the analysis thread
+//! or by a finished update check. Nothing is rendered unless an overlay is
+//! visible and its renderer reports changed pixels.
 
 use std::error::Error;
 use std::io;
@@ -32,7 +33,7 @@ use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
 use crate::analysis::{self, Analysis, CalibUpdate, Control};
-use crate::{autostart, exit, instance, signals, VERSION_LINE};
+use crate::{autostart, exit, instance, signals, update, VERSION_LINE};
 
 /// Overlay key of the HUD (SPEC §4.1).
 pub const HUD_KEY: &str = "codeyumx.frame-vocal-pitch.hud";
@@ -133,6 +134,7 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
         autostart: autostart::Autostart::new(),
         autostart_enabled: false,
         quit: false,
+        updater: update::Updater::new()?,
     };
     app.run_loop(&signal_handles)
 }
@@ -212,6 +214,8 @@ struct App {
     autostart_enabled: bool,
     /// The user chose Quit in the dashboard.
     quit: bool,
+    /// Update checks and installs (§7.1).
+    updater: update::Updater,
 }
 
 impl App {
@@ -230,6 +234,7 @@ impl App {
             }
 
             analysis::drain(&self.wake_rx);
+            self.updater.drain_wake();
             let now = Instant::now();
 
             if now >= self.status_at {
@@ -242,6 +247,7 @@ impl App {
                 self.refresh_autostart(now);
             }
             self.poll_tone();
+            self.updater.tick(now, self.cfg.update.check);
 
             let snapshot = self.analysis.take();
             if let Some(minutes) = snapshot.toast_minutes {
@@ -296,12 +302,19 @@ impl App {
     /// Nearest moment the loop has work to do.
     fn next_deadline(&self) -> Instant {
         let mut deadline = self.config_at.min(self.status_at).min(self.autostart_at);
+        if let Some(update_at) = self.updater.next_deadline() {
+            deadline = deadline.min(update_at);
+        }
         match &self.session {
             None => deadline.min(self.retry_at),
-            Some(_) => {
+            Some(session) => {
                 deadline = deadline.min(self.controller_at);
                 if self.hud.animating() {
                     deadline = deadline.min(Instant::now() + ANIMATION_INTERVAL);
+                }
+                // The "Confirm update" button reverts after its window.
+                if let Some(panel_at) = self.panel.next_deadline().filter(|_| session.dashboard_active) {
+                    deadline = deadline.min(panel_at);
                 }
                 deadline
             }
@@ -317,6 +330,7 @@ impl App {
                 PollFd::new(fds[0], PollFlags::POLLIN),
                 PollFd::new(fds[1], PollFlags::POLLIN),
                 PollFd::new(self.wake_rx.as_fd(), PollFlags::POLLIN),
+                PollFd::new(self.updater.wake_fd(), PollFlags::POLLIN),
             ];
             let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
             match poll(&mut poll_fds, timeout) {
@@ -802,6 +816,8 @@ impl App {
                 self.panel.invalidate();
             }
             Action::StartCalibration(which) => self.start_calibration(which),
+            Action::CheckUpdates => self.updater.check_now(),
+            Action::StartUpdate(version) => self.updater.start_update(&version, Instant::now()),
             Action::Quit => self.quit = true,
         }
     }
@@ -970,6 +986,7 @@ impl App {
             mic_status_line: status_line(self.status.as_ref()),
             autostart: self.autostart_enabled,
             resonance,
+            update: self.updater.view(),
         };
         if let Some(frame) = self.panel.render(&self.cfg, &live) {
             let frame = FrameRef {

@@ -1,13 +1,14 @@
 //! The one-shot CLI modes of SPEC §6.4: `--probe`, `--analyze F.wav`, `--bench`
-//! and `--render-png DIR`. None of them touches SteamVR or a GPU (`--probe` only
-//! asks whether SteamVR is running), so they all work on a desktop machine.
+//! and `--render-png DIR`, plus the hidden `--check-update` diagnostic. None of them touches
+//! SteamVR or a GPU (`--probe` only asks whether SteamVR is running), so they all work on a
+//! desktop machine.
 
 use std::error::Error;
 use std::path::Path;
 
 use fvp_pitch::{Class, PitchParams};
 
-use crate::{exit, wav};
+use crate::{exit, update, wav};
 
 /// `--probe`: OpenVR library and SteamVR state, then the audio graph report.
 pub fn probe() -> Result<u8, Box<dyn Error>> {
@@ -154,6 +155,28 @@ pub fn render_png(dir: &Path) -> Result<u8, Box<dyn Error>> {
     }
     println!("{} files written to {}", written.len(), dir.display());
     Ok(exit::OK)
+}
+
+/// `--check-update[=X.Y.Z]`: asks GitHub for the latest release now (the real `curl` request of
+/// §7.1, without touching the cache) and prints the Updates status line for the running version
+/// or `against`.
+pub fn check_update(against: Option<&str>) -> Result<u8, Box<dyn Error>> {
+    let current = match against {
+        Some(text) => update::Version::parse(text)
+            .ok_or_else(|| format!("invalid version '{text}' (expected X.Y.Z)"))?,
+        None => update::current_version(),
+    };
+    println!("{}", crate::VERSION_LINE);
+    println!("compared with: {current}");
+    let result = update::fetch_latest(&update::Programs::default().curl);
+    if let Ok(latest) = &result {
+        println!("latest release: {}", latest.tag());
+    }
+    let ok = result.is_ok();
+    let record = update::CheckRecord::new(result, None, 0);
+    let (status, _) = update::check_status(Some(&record), current, 0);
+    println!("status: {}", fvp_ui::update_status_text(&status));
+    Ok(if ok { exit::OK } else { exit::FAILURE })
 }
 
 #[cfg(test)]

@@ -30,6 +30,9 @@ pub enum Mode {
     Analyze(PathBuf),
     Bench,
     RenderPng(PathBuf),
+    /// Hidden diagnostic `--check-update[=X.Y.Z]`: ask GitHub for the latest release now and
+    /// print the Updates status line, comparing against `X.Y.Z` instead of the running version.
+    CheckUpdate(Option<String>),
 }
 
 /// Parsed command line.
@@ -72,7 +75,8 @@ impl Args {
                 _ => (text.clone(), None),
             };
             let takes_value = matches!(name.as_str(), "--analyze" | "--render-png");
-            if !takes_value && inline.is_some() {
+            let optional_value = name == "--check-update";
+            if !takes_value && !optional_value && inline.is_some() {
                 return Err(UsageError(format!("option {name} takes no value")));
             }
             let mut value = || -> Result<PathBuf, UsageError> {
@@ -98,6 +102,9 @@ impl Args {
                 "--bench" => Mode::Bench,
                 "--analyze" => Mode::Analyze(value()?),
                 "--render-png" => Mode::RenderPng(value()?),
+                "--check-update" => {
+                    Mode::CheckUpdate(inline.as_ref().map(|v| v.to_string_lossy().into_owned()))
+                }
                 _ => return Err(UsageError(format!("unknown argument '{text}'"))),
             };
             if let Some((previous, _)) = &mode {
@@ -130,6 +137,7 @@ pub fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         Mode::Analyze(path) => commands::analyze(path),
         Mode::Bench => commands::bench(),
         Mode::RenderPng(dir) => commands::render_png(dir),
+        Mode::CheckUpdate(against) => commands::check_update(against.as_deref()),
         Mode::Run => runtime::run(),
     }
 }
@@ -183,6 +191,11 @@ mod tests {
         assert_eq!(
             mode(&["--render-png=out=1"]),
             Mode::RenderPng("out=1".into())
+        );
+        assert_eq!(mode(&["--check-update"]), Mode::CheckUpdate(None));
+        assert_eq!(
+            mode(&["--check-update=0.2.0"]),
+            Mode::CheckUpdate(Some("0.2.0".into()))
         );
     }
 

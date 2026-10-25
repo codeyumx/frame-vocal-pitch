@@ -46,6 +46,7 @@ pub struct Config {
     pub vocal_rest: VocalRest,
     pub audio: Audio,
     pub resonance: Resonance,
+    pub update: Update,
 }
 
 /// `[hud]`
@@ -194,6 +195,20 @@ impl Default for Resonance {
             relaxed_df_hz: None,
             target_df_hz: None,
         }
+    }
+}
+
+/// `[update]` (SPEC §7.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Update {
+    /// Automatic update checks; "Check now" and "Update" work either way.
+    pub check: bool,
+}
+
+impl Default for Update {
+    fn default() -> Self {
+        Update { check: true }
     }
 }
 
@@ -759,6 +774,7 @@ mod tests {
         assert_eq!(c.resonance.window_s, 8.0);
         assert_eq!(c.resonance.relaxed_df_hz, None);
         assert_eq!(c.resonance.target_df_hz, None);
+        assert!(c.update.check);
         assert!(
             !to_toml(&c).contains("_df_hz"),
             "absent calibration is omitted"
@@ -964,6 +980,7 @@ mod tests {
         c.resonance.window_s = 12.5;
         c.resonance.relaxed_df_hz = Some(1031.25);
         c.resonance.target_df_hz = Some(1187.4);
+        c.update.check = false;
 
         let text = to_toml(&c);
         assert!(
@@ -971,6 +988,7 @@ mod tests {
             "shortest float form:\n{text}"
         );
         assert!(text.contains("placement = \"right_wrist\""));
+        assert!(text.contains("[update]\ncheck = false\n"), "{text}");
         assert_eq!(parse(&text).unwrap(), c);
 
         let dir = TempDir::new();

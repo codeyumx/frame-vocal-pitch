@@ -183,6 +183,10 @@ Controls (each writes the config file immediately):
 - Reminder tone: on/off, delay (0.5–10 s), pitch (100–1000 Hz), volume (0–100 %).
 - Vocal rest: off or 5–50 min of voiced time per rolling 60 min.
 - Autostart with SteamVR on/off (enables/disables the user unit).
+- Updates (§7.1): current version, status line ("Up to date · checked 2 h ago", "Version X.Y.Z is
+  available", "Checking…", "Updating to X.Y.Z…", "Update failed: <reason>", "Couldn't check: <reason>"),
+  buttons "Check now" and, only when a newer release exists, "Update to X.Y.Z" (asks for a second
+  click "Confirm update" within 10 s, so a stray click cannot start it). Toggle "Check automatically".
 - Mic input: **"Bypass Valve processing (this app only)"** (default) / "Use processed mic". Below it a
   status line (§6.3) naming the node actually recorded from and any fallback reason.
 - Quit (exits with status 3 so the service does not restart it). Label "Quit" plus a one-line hint
@@ -333,6 +337,7 @@ strings → default and a log line):
 | `resonance.enabled` | bool | `false` | §5.1; set only after the explanation card was acknowledged |
 | `resonance.window_s` | float | 8 | 4–20 |
 | `resonance.relaxed_df_hz`, `resonance.target_df_hz` | float or absent | absent | calibration results (§5.1); absent = not calibrated |
+| `update.check` | bool | `true` | automatic update checks (§7.1); "Check now" and "Update" work either way |
 
 Autostart is not a config key: it is the enabled state of the systemd user unit (§7).
 
@@ -431,8 +436,13 @@ curl -fsSL https://github.com/codeyumx/frame-vocal-pitch/releases/latest/downloa
 - Idempotent: re-running updates in place; if the service is active, restart it; otherwise stop a
   manually started instance via the PID in the lock file.
 - Options: `--autostart` / `--no-autostart` (enable/disable unit), `--uninstall` (remove everything
-  except config), `--uninstall --purge` (also config), `--version` (print version of the payload).
-- Record chosen options in `~/.config/frame-vocal-pitch/install-args` so updates keep them.
+  except config), `--uninstall --purge` (also config), `--version` (print version of the payload),
+  `--release vX.Y.Z` (piped/lone-file mode only: download that tag instead of the latest; refuse if
+  the tag or its `SHA256SUMS` is missing).
+- Record chosen options in `~/.config/frame-vocal-pitch/install-args` so updates keep them
+  (`--release` is never recorded).
+- Also install a copy of itself as the updater, `~/.local/share/frame-vocal-pitch/install.sh` (mode
+  0755); `--uninstall` removes `~/.local/share/frame-vocal-pitch/` and `~/.cache/frame-vocal-pitch/`.
 - Use `XDG_RUNTIME_DIR=/run/user/$(id -u)` for `systemctl --user` calls (Desktop Mode fix).
 
 systemd user unit:
@@ -451,7 +461,49 @@ SuccessExitStatus=3
 WantedBy=steamvr.service
 ```
 
-In-app update check: out of scope for v1 (re-run the install command).
+### 7.1 Self-update
+Modelled on the user experience of other Frame tools: check quietly, install only after the user
+confirms, never leave a broken install.
+
+Check:
+- The app asks GitHub `https://api.github.com/repos/codeyumx/frame-vocal-pitch/releases/latest` for
+  `tag_name` (use `curl -fsSL --max-time 15` as a child process on a helper thread; no TLS library in
+  the binary; never block the main loop). Ignore drafts/prereleases (the endpoint already does).
+- Newer = semantic-version comparison of `tag_name` (leading `v` stripped) against the running version.
+- Automatic checks (`update.check = true`): at start and every hour, but hit the network at most once
+  per 24 h; after a failed check retry after 1 h. Cache `{checked_at, latest, error}` in
+  `~/.cache/frame-vocal-pitch/update-check.json`. "Check now" ignores the cache.
+- Never notify on the HUD; the dashboard Updates section is the only place updates appear.
+
+Install (only after "Update to X.Y.Z" + "Confirm update"):
+- Run the updater in a transient systemd user unit so it survives the service restart:
+  `systemd-run --user --unit=frame-vocal-pitch-update --collect --property=StandardOutput=append:<log>
+  --property=StandardError=append:<log> /bin/bash ~/.local/share/frame-vocal-pitch/install.sh
+  --release vX.Y.Z` with `<log>` = `~/.cache/frame-vocal-pitch/update.log` (truncate it first),
+  `XDG_RUNTIME_DIR=/run/user/<uid>`. If the unit name is already active, show "An update is already
+  running".
+- The installer downloads that exact tag, verifies `SHA256SUMS`, re-runs the release's own
+  `install.sh` with the recorded install-args, and restarts the service, which ends the old process.
+  If the app was started by hand (no active service), the installer stops it via the lock-file PID;
+  the app then shows nothing more, so before starting the update it shows "Updating… the app will close;
+  start it again from the + list" in that case.
+- Failure: the installer must not touch the installed files before the download is verified; any
+  failure leaves the current version installed and running. The app polls the unit
+  (`systemctl --user show frame-vocal-pitch-update -p ActiveState -p Result`) every 2 s while updating
+  and shows "Update failed: <last non-empty line of update.log>" if it ends without the process being
+  replaced.
+- Security note for the README: `SHA256SUMS` comes from the same release, so this catches broken
+  downloads, not a replaced release; it is a checksum, not a signature.
+- Versions up to 0.2.1 have no updater: update once by re-running the install command.
+
+Acceptance:
+- Unit tests: version comparison (`v0.10.0 > v0.9.9`, equal, malformed tag → "Couldn't check"), cache
+  rules (24 h, 1 h after failure, Check now bypass, `update.check = false` disables only automatic
+  checks), the two-step confirm with its 10 s timeout, status-line texts.
+- `scripts/test-install.sh` extended: `--release` with a fake download URL installs that version,
+  a checksum mismatch or missing tag changes nothing, the updater copy is installed, and `--uninstall`
+  removes it and the cache dir.
+- Host smoke: with `curl` against the real GitHub API the app reports the current latest release.
 
 ---
 

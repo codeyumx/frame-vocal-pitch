@@ -25,8 +25,8 @@ else
 fi
 
 cleanup() {
-    pkill -f "$T/home/.local/bin/frame-vocal-pitch" 2>/dev/null
-    pkill -f "$T/stub/frame-vocal-pitch" 2>/dev/null
+    pkill -f "$T/home" 2>/dev/null
+    pkill -f "$T/stub" 2>/dev/null
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -39,8 +39,14 @@ bad() {
 expect_gone() { if [ -e "$1" ]; then bad "still exists: $1"; else ok "removed: $1"; fi; }
 expect_there() { if [ -e "$1" ]; then ok "exists: $1"; else bad "missing: $1"; fi; }
 hr() { printf '\n%s== %s%s\n' "$C_HEAD" "$*" "$C_OFF"; }
+# Every path, type and mode under $1 plus every file's sha256: equal output = byte-identical tree.
+snapshot() {
+    (cd "$1" && find . -printf '%m %y %p\n' | sort && find . -type f -exec sha256sum {} + | sort)
+}
+# Last non-empty line of $1.
+last_line() { printf '%s\n' "$1" | awk 'NF { l = $0 } END { print l }'; }
 
-mkdir -p "$T"/{bin,stub,dist,dist-bad,payload,lone,run}
+mkdir -p "$T"/{bin,stub,stub2,dist,dist-bad,payload,lone,run,releases}
 
 # Fake systemctl: records every call with the XDG_RUNTIME_DIR it was given, and fakes the two
 # state queries through marker files.
@@ -64,14 +70,18 @@ EOF
 chmod +x "$T/bin/systemctl"
 
 # Stub payload: a native binary that writes its PID to the lock file and waits for SIGTERM, so the
-# "stop a manually started instance" path can be observed.
+# "stop a manually started instance" path can be observed. MARK makes builds for different
+# versions differ byte for byte.
 cat >"$T/stub/stub.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+static const char mark[] = MARK;
 int main(void)
 {
     const char *lock = getenv("FVP_TEST_LOCK");
+    if (getenv("FVP_TEST_MARK"))
+        puts(mark);
     if (lock) {
         FILE *f = fopen(lock, "w");
         if (f) {
@@ -87,13 +97,29 @@ command -v cc >/dev/null || {
     printf 'error: cc is required to build the stub binary\n' >&2
     exit 1
 }
-cc -O1 -o "$T/stub/frame-vocal-pitch" "$T/stub/stub.c" || exit 1
+cc -O1 -DMARK="\"$VERSION\"" -o "$T/stub/frame-vocal-pitch" "$T/stub/stub.c" || exit 1
 
 hr "package a $VERSION payload around the stub binary"
 FVP_PACKAGE_ALLOW_ARCH=1 DIST_DIR="$T/dist" \
     "$ROOT/scripts/package.sh" "$VERSION" "$T/stub/frame-vocal-pitch" || exit 1
 tar -xzf "$T/dist/frame-vocal-pitch-$VERSION-aarch64.tar.gz" -C "$T/payload"
 PAYLOAD=$T/payload/frame-vocal-pitch-$VERSION
+
+# Releases for the --release tests, laid out like releases/download/<tag>/ on GitHub:
+#   v9.9.9   the payload above          v9.10.0  a newer, different binary
+#   v9.11.0  SHA256SUMS does not match  v9.12.0  no SHA256SUMS
+#   v9.13.0  SHA256SUMS lists another version's tarball           (v9.99.0 does not exist)
+NEW=9.10.0
+cc -O1 -DMARK="\"$NEW\"" -o "$T/stub2/frame-vocal-pitch" "$T/stub/stub.c" || exit 1
+cp -r "$T/dist" "$T/releases/v$VERSION"
+for v in "$NEW" 9.11.0 9.12.0; do
+    FVP_PACKAGE_ALLOW_ARCH=1 DIST_DIR="$T/releases/v$v" \
+        "$ROOT/scripts/package.sh" "$v" "$T/stub2/frame-vocal-pitch" >/dev/null || exit 1
+done
+printf '%064d  frame-vocal-pitch-9.11.0-aarch64.tar.gz\n' 0 >"$T/releases/v9.11.0/SHA256SUMS"
+rm "$T/releases/v9.12.0/SHA256SUMS"
+mkdir -p "$T/releases/v9.13.0"
+cp "$T/releases/v$NEW/"* "$T/releases/v9.13.0/"
 
 export PATH="$T/bin:$PATH"
 export FVP_TEST_SYSTEMCTL_LOG="$T/systemctl.log"
@@ -114,6 +140,12 @@ cat "$H/.local/share/applications/frame-vocal-pitch.desktop"
 
 expect_there "$H/.local/bin/frame-vocal-pitch"
 [ -x "$H/.local/bin/frame-vocal-pitch" ] && ok "binary is executable" || bad "binary not executable"
+UPDATER=$H/.local/share/frame-vocal-pitch/install.sh
+cmp -s "$PAYLOAD/install.sh" "$UPDATER" &&
+    ok "updater copy installed at ~/.local/share/frame-vocal-pitch/install.sh" ||
+    bad "updater copy missing or differs from the payload's install.sh"
+mode=$(stat -c %a "$UPDATER" 2>/dev/null)
+[ "$mode" = 755 ] && ok "updater copy is 0755" || bad "updater copy is ${mode:-missing}"
 cmp -s "$T/stub/frame-vocal-pitch" "$H/.local/bin/frame-vocal-pitch" &&
     ok "binary matches payload" || bad "binary differs"
 cmp -s "$PAYLOAD/frame-vocal-pitch.service" "$H/.config/systemd/user/frame-vocal-pitch.service" &&
@@ -201,9 +233,14 @@ echo "$v"
 [ "$v" = "frame-vocal-pitch $VERSION" ] && ok "--version prints the payload version" ||
     bad "--version printed '$v'"
 
-hr "7. --uninstall keeps the configuration"
+hr "7. --uninstall keeps the configuration, removes the updater and the cache"
+mkdir -p "$H/.cache/frame-vocal-pitch"
+: >"$H/.cache/frame-vocal-pitch/update.log"
+: >"$H/.cache/frame-vocal-pitch/update-check.json"
 HOME=$H FVP_INSTALL_ALLOW_ARCH=1 XDG_RUNTIME_DIR=$T/run \
     bash "$PAYLOAD/install.sh" --uninstall
+expect_gone "$H/.local/share/frame-vocal-pitch"
+expect_gone "$H/.cache/frame-vocal-pitch"
 expect_gone "$H/.local/bin/frame-vocal-pitch"
 expect_gone "$H/.config/systemd/user/frame-vocal-pitch.service"
 expect_gone "$H/.local/share/applications/frame-vocal-pitch.desktop"
@@ -262,6 +299,113 @@ rc=$?
 HOME=$H4 XDG_RUNTIME_DIR=$T/run bash "$PAYLOAD/install.sh" --uninstall
 rc=$?
 [ $rc -ne 0 ] && ok "refused to uninstall (exit $rc)" || bad "uninstall not refused"
+
+hr "12. self-update: the installed updater with --release"
+H5=$T/home5
+UPD5=$H5/.local/share/frame-vocal-pitch/install.sh
+mkdir -p "$H5"
+HOME=$H5 FVP_INSTALL_ALLOW_ARCH=1 XDG_RUNTIME_DIR=$T/run \
+    bash "$PAYLOAD/install.sh" --autostart >/dev/null
+expect_there "$UPD5"
+
+# A running instance must survive every refused update.
+rm -f "$T/run/frame-vocal-pitch.lock"
+HOME=$H5 FVP_TEST_LOCK=$T/run/frame-vocal-pitch.lock "$H5/.local/bin/frame-vocal-pitch" &
+running=$!
+for _ in $(seq 50); do
+    [ -s "$T/run/frame-vocal-pitch.lock" ] && break
+    sleep 0.1
+done
+
+# Runs the installed updater like the app does: lone file, output appended to one log.
+run_updater() {
+    : >"$T/update.log"
+    HOME=$H5 FVP_INSTALL_ALLOW_ARCH=1 XDG_RUNTIME_DIR=$T/run \
+        FVP_INSTALL_DOWNLOAD_URL="file://$T/releases" \
+        /bin/bash "$UPD5" "$@" >>"$T/update.log" 2>&1
+}
+
+# refuse NAME PATTERN ARGS...: the run fails, its last line matches PATTERN, and nothing changed.
+refuse() {
+    local what=$1 pattern=$2 rc last before after
+    shift 2
+    before=$(snapshot "$H5")
+    : >"$FVP_TEST_SYSTEMCTL_LOG"
+    run_updater "$@"
+    rc=$?
+    after=$(snapshot "$H5")
+    last=$(last_line "$(cat "$T/update.log")")
+    printf '  %s -> exit %s, last line: %s\n' "$what" "$rc" "$last"
+    [ $rc -ne 0 ] && ok "$what: refused" || bad "$what: exit 0"
+    [[ $last == *$pattern* ]] && ok "$what: last line names the reason" ||
+        bad "$what: last line does not mention '$pattern'"
+    if [ "$before" = "$after" ]; then
+        ok "$what: installation byte-identical"
+    else
+        bad "$what: installation changed"
+        diff <(echo "$before") <(echo "$after")
+    fi
+    [ -s "$FVP_TEST_SYSTEMCTL_LOG" ] && bad "$what: systemctl was called" ||
+        ok "$what: no systemctl call"
+}
+
+refuse "missing tag" "release v9.99.0 or its SHA256SUMS not found" --release v9.99.0
+refuse "checksum mismatch" "checksum mismatch" --release v9.11.0
+refuse "missing SHA256SUMS" "release v9.12.0 or its SHA256SUMS not found" --release v9.12.0
+refuse "SHA256SUMS of another version" "lists no frame-vocal-pitch-9.13.0-aarch64.tar.gz" \
+    --release v9.13.0
+refuse "malformed tag" "needs a tag such as v1.2.3" --release 9.10.0
+refuse "tag missing after --release" "needs a tag such as v1.2.3" --release
+refuse "--release with --uninstall" "cannot be combined with --release" --uninstall --release v9.10.0
+
+if kill -0 "$running" 2>/dev/null; then
+    ok "the running instance survived the refused updates"
+else
+    bad "the running instance was stopped by a refused update"
+fi
+
+out=$(HOME=$H5 FVP_INSTALL_ALLOW_ARCH=1 XDG_RUNTIME_DIR=$T/run \
+    bash "$PAYLOAD/install.sh" --release "v$NEW" 2>&1)
+rc=$?
+echo "  from a release folder -> exit $rc, last line: $(last_line "$out")"
+[ $rc -ne 0 ] && [[ $(last_line "$out") == *"only works when install.sh is piped"* ]] &&
+    ok "--release is refused inside an extracted release" || bad "--release accepted in a release folder"
+
+out=$(HOME=$H5 FVP_INSTALL_ALLOW_ARCH=1 XDG_RUNTIME_DIR=$T/run \
+    FVP_INSTALL_DOWNLOAD_URL="file://$T/releases" \
+    bash -s -- --version --release "v$NEW" <"$T/lone/install.sh")
+printf '%s\n' "$out" | grep -qx "frame-vocal-pitch $NEW" &&
+    ok "piped --version --release v$NEW prints $NEW" || bad "piped --version --release wrong"
+
+: >"$FVP_TEST_SYSTEMCTL_LOG"
+run_updater --release "v$NEW"
+rc=$?
+echo "-- update.log"
+cat "$T/update.log"
+[ $rc -eq 0 ] && ok "update to v$NEW exit 0" || bad "update to v$NEW exit $rc"
+cmp -s "$T/stub2/frame-vocal-pitch" "$H5/.local/bin/frame-vocal-pitch" &&
+    ok "binary is the v$NEW build" || bad "binary is not the v$NEW build"
+grep -qx "PAYLOAD_VERSION='$NEW'" "$UPD5" &&
+    ok "updater copy replaced by the v$NEW installer" || bad "updater copy not updated"
+[ "$(cat "$H5/.config/frame-vocal-pitch/install-args")" = --autostart ] &&
+    ok "install-args still just --autostart (no --release recorded)" ||
+    bad "install-args: $(tr '\n' ' ' <"$H5/.config/frame-vocal-pitch/install-args")"
+grep -q "systemctl --user enable" "$FVP_TEST_SYSTEMCTL_LOG" &&
+    ok "recorded --autostart applied by the update" || bad "autostart lost in the update"
+if kill -0 "$running" 2>/dev/null; then
+    bad "manually started instance still running after the update"
+    kill -KILL "$running" 2>/dev/null
+else
+    ok "manually started instance stopped by the update"
+fi
+wait "$running" 2>/dev/null
+
+run_updater --release "v$VERSION"
+rc=$?
+[ $rc -eq 0 ] && cmp -s "$T/stub/frame-vocal-pitch" "$H5/.local/bin/frame-vocal-pitch" &&
+    grep -qx "PAYLOAD_VERSION='$VERSION'" "$UPD5" &&
+    ok "--release v$VERSION installs exactly that (older) version" ||
+    bad "--release v$VERSION did not install $VERSION (exit $rc)"
 
 printf '\n'
 if [ $FAILED -eq 0 ]; then

@@ -77,6 +77,36 @@ pub struct Strings {
 
     pub tab_general: &'static str,
     pub tab_resonance: &'static str,
+    pub tab_updates: &'static str,
+
+    // "About & updates" page (§4.2, §7.1).
+    pub section_updates: &'static str,
+    pub upd_version: &'static str,
+    pub upd_auto: &'static str,
+    pub upd_check_now: &'static str,
+    /// Button template; `{v}` is replaced by the newer version.
+    pub upd_update_to: &'static str,
+    pub upd_confirm: &'static str,
+    pub upd_hint: &'static str,
+    /// Status lines. `{v}` = version, `{reason}` = failure reason, `{ago}` = one of the
+    /// `upd_ago_*` texts with `{n}` replaced.
+    pub upd_not_checked: &'static str,
+    pub upd_up_to_date: &'static str,
+    pub upd_ago_now: &'static str,
+    pub upd_ago_min: &'static str,
+    pub upd_ago_h: &'static str,
+    pub upd_ago_d: &'static str,
+    pub upd_available: &'static str,
+    pub upd_checking: &'static str,
+    pub upd_updating: &'static str,
+    pub upd_updating_manual: &'static str,
+    pub upd_already_running: &'static str,
+    pub upd_failed: &'static str,
+    pub upd_check_failed: &'static str,
+    pub section_about: &'static str,
+    /// `{v}` = the running version.
+    pub about_name: &'static str,
+    pub about_lines: [&'static str; 3],
 
     // Resonance indicator on the HUD (§4.1, §5.1); shown in a narrow column, keep short.
     pub hud_res_relaxed: &'static str,
@@ -196,6 +226,36 @@ pub const EN: Strings = Strings {
 
     tab_general: "General",
     tab_resonance: "Resonance (experimental)",
+    tab_updates: "About & updates",
+
+    section_updates: "Updates",
+    upd_version: "Version",
+    upd_auto: "Check automatically",
+    upd_check_now: "Check now",
+    upd_update_to: "Update to {v}",
+    upd_confirm: "Confirm update",
+    upd_hint: "Checks GitHub at most once a day. Nothing is installed until you confirm, and a \
+               failed update keeps the current version.",
+    upd_not_checked: "Not checked yet",
+    upd_up_to_date: "Up to date \u{00b7} checked {ago}",
+    upd_ago_now: "just now",
+    upd_ago_min: "{n} min ago",
+    upd_ago_h: "{n} h ago",
+    upd_ago_d: "{n} d ago",
+    upd_available: "Version {v} is available",
+    upd_checking: "Checking\u{2026}",
+    upd_updating: "Updating to {v}\u{2026}",
+    upd_updating_manual: "Updating\u{2026} the app will close; start it again from the + list",
+    upd_already_running: "An update is already running",
+    upd_failed: "Update failed: {reason}",
+    upd_check_failed: "Couldn't check: {reason}",
+    section_about: "About",
+    about_name: "frame-vocal-pitch {v}",
+    about_lines: [
+        "Vocal pitch trainer overlay for SteamVR",
+        "Source: github.com/codeyumx/frame-vocal-pitch",
+        "License: Apache-2.0",
+    ],
 
     hud_res_relaxed: "relaxed",
     hud_res_target: "target",

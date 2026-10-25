@@ -10,7 +10,9 @@ use fvp_config::{Config, DisplayMode, MicMode, Preset};
 use tiny_skia::{IntSize, Pixmap};
 
 use crate::hud::{Hud, HudState, HudView, ResonanceView};
-use crate::settings::{CalibStatus, Card, LiveInfo, Page, ResonanceLive, SettingsPanel};
+use crate::settings::{
+    CalibStatus, Card, LiveInfo, Page, ResonanceLive, SettingsPanel, UpdateLive, UpdateStatus,
+};
 use crate::strings::STRINGS;
 use crate::{icon, Frame};
 
@@ -129,6 +131,11 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
             .into(),
         autostart: true,
         resonance: ResonanceLive::default(),
+        update: UpdateLive {
+            version: env!("CARGO_PKG_VERSION"),
+            status: UpdateStatus::UpToDate { checked_ago_min: 125 },
+            available: None,
+        },
     };
     emit("settings.png".into(), SettingsPanel::new().render(&cfg, &live))?;
 
@@ -151,6 +158,7 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
             .into(),
         autostart: false,
         resonance: ResonanceLive::default(),
+        update: UpdateLive::default(),
     };
     emit("settings-custom.png".into(), SettingsPanel::new().render(&custom, &fallback))?;
 
@@ -189,5 +197,30 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     emit("settings-card-enable-scrolled.png".into(), card.render(&cfg, &live))?;
     card.show(Page::Resonance, Some(Card::Info));
     emit("settings-card-info.png".into(), card.render(&on, &recording))?;
+
+    // Updates page: up to date, a newer release (then armed for confirmation), updating after a
+    // manual start, and the two failure lines.
+    let mut updates = SettingsPanel::new();
+    updates.show(Page::Updates, None);
+    emit("settings-updates.png".into(), updates.render(&cfg, &live))?;
+    let with = |status: UpdateStatus, available: Option<&str>| LiveInfo {
+        update: UpdateLive { status, available: available.map(str::to_string), ..live.update.clone() },
+        ..live.clone()
+    };
+    let available = with(UpdateStatus::Available("0.3.0".into()), Some("0.3.0"));
+    emit("settings-updates-available.png".into(), updates.render(&cfg, &available))?;
+    updates.arm_update();
+    emit("settings-updates-confirm.png".into(), updates.render(&cfg, &available))?;
+    let mut manual_cfg = cfg.clone();
+    manual_cfg.update.check = false;
+    let manual = with(UpdateStatus::UpdatingManual, Some("0.3.0"));
+    emit("settings-updates-updating.png".into(), updates.render(&manual_cfg, &manual))?;
+    let failed = with(
+        UpdateStatus::UpdateFailed("checksum mismatch for frame-vocal-pitch-0.3.0-aarch64.tar.gz; nothing was changed".into()),
+        Some("0.3.0"),
+    );
+    emit("settings-updates-failed.png".into(), updates.render(&cfg, &failed))?;
+    let offline = with(UpdateStatus::CheckFailed("Could not resolve host: api.github.com".into()), None);
+    emit("settings-updates-offline.png".into(), updates.render(&cfg, &offline))?;
     Ok(written)
 }

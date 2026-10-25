@@ -195,18 +195,19 @@ for registry crates, `crates/openvr/vendor/LICENSE` for the vendored OpenVR head
 | `flate2` | 1.1.10 | MIT OR Apache-2.0 | runtime |
 | `foldhash` | 0.1.5 | Zlib | runtime |
 | `fontdue` | 0.9.5 | MIT OR Apache-2.0 OR Zlib | runtime |
-| `frame-vocal-pitch` | 0.2.1 | Apache-2.0 | this project |
-| `fvp-audio` | 0.2.1 | Apache-2.0 | this project |
-| `fvp-config` | 0.2.1 | Apache-2.0 | this project |
-| `fvp-openvr` | 0.2.1 | Apache-2.0 | this project |
-| `fvp-pitch` | 0.2.1 | Apache-2.0 | this project |
-| `fvp-ui` | 0.2.1 | Apache-2.0 | this project |
+| `frame-vocal-pitch` | 0.3.0 | Apache-2.0 | this project |
+| `fvp-audio` | 0.3.0 | Apache-2.0 | this project |
+| `fvp-config` | 0.3.0 | Apache-2.0 | this project |
+| `fvp-openvr` | 0.3.0 | Apache-2.0 | this project |
+| `fvp-pitch` | 0.3.0 | Apache-2.0 | this project |
+| `fvp-ui` | 0.3.0 | Apache-2.0 | this project |
 | `glob` | 0.3.4 | MIT OR Apache-2.0 | build |
 | `hashbrown` | 0.15.5 | MIT OR Apache-2.0 | runtime |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | runtime |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | build |
 | `indexmap` | 2.14.2 | Apache-2.0 OR MIT | runtime |
 | `itertools` | 0.13.0 | MIT OR Apache-2.0 | build |
+| `itoa` | 1.0.18 | MIT OR Apache-2.0 | runtime |
 | `libc` | 0.2.191 | MIT OR Apache-2.0 | runtime |
 | `libloading` | 0.8.9 | ISC | runtime |
 | `libm` | 0.2.16 | MIT | runtime |
@@ -242,6 +243,7 @@ for registry crates, `crates/openvr/vendor/LICENSE` for the vendored OpenVR head
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | runtime |
 | `serde_core` | 1.0.229 | MIT OR Apache-2.0 | runtime |
 | `serde_derive` | 1.0.229 | MIT OR Apache-2.0 | runtime |
+| `serde_json` | 1.0.154 | MIT OR Apache-2.0 | runtime |
 | `serde_spanned` | 0.6.9 | MIT OR Apache-2.0 | runtime |
 | `serde_spanned` | 1.1.2 | MIT OR Apache-2.0 | build |
 | `shlex` | 1.3.0 | MIT OR Apache-2.0 | build |
@@ -276,6 +278,7 @@ for registry crates, `crates/openvr/vendor/LICENSE` for the vendored OpenVR head
 | `winnow` | 0.7.15 | MIT | runtime |
 | `winnow` | 1.0.4 | MIT | build |
 | `zlib-rs` | 0.6.8 | Zlib | runtime |
+| `zmij` | 1.0.23 | MIT | runtime |
 <!-- crate-table:end -->
 
 ## System libraries (not shipped)

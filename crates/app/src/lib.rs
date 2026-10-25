@@ -1,6 +1,6 @@
 //! Process shell of frame-vocal-pitch: command line (SPEC §6.4), single instance and signals
-//! (§6.2), logging, the autostart user unit (§7), the WAV reader behind `--analyze`, the
-//! capture→pitch analysis thread (§3) and the overlay run loop (§3.1, §4).
+//! (§6.2), logging, the autostart user unit (§7), self-update (§7.1), the WAV reader behind
+//! `--analyze`, the capture→pitch analysis thread (§3) and the overlay run loop (§3.1, §4).
 
 #![forbid(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -13,6 +13,7 @@ pub mod instance;
 pub mod logging;
 pub mod runtime;
 pub mod signals;
+pub mod update;
 pub mod wav;
 
 use std::process::ExitCode;

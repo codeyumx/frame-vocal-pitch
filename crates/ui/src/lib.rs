@@ -20,8 +20,9 @@ pub use hud::{
 pub use icon::{icon_png, render_icon};
 pub use preview::render_all_png;
 pub use settings::{
-    steps, Action, CalibStatus, CalibWhich, LiveInfo, ResonanceLive, SettingsPanel,
-    SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
+    steps, update_status_text, Action, CalibStatus, CalibWhich, LiveInfo, ResonanceLive,
+    SettingsPanel, UpdateLive, UpdateStatus, SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
+    UPDATE_CONFIRM_WINDOW,
 };
 pub use strings::{vocal_rest_toast, Strings, EN, STRINGS};
 
