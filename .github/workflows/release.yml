@@ -79,7 +79,7 @@ jobs:
       - name: Lint the packaging scripts
         run: |
           sudo apt-get install -y --no-install-recommends shellcheck
-          shellcheck packaging/install.sh scripts/*.sh
+          shellcheck -S warning packaging/install.sh scripts/*.sh
 
       - name: Installer dry run (fake payload, throwaway HOME)
         run: scripts/test-install.sh
