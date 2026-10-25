@@ -1,0 +1,12 @@
+[package]
+name = "fvp-ui"
+description = "CPU-rendered HUD and dashboard settings panel for frame-vocal-pitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fontdue = "0.9"
+tiny-skia = "0.12"
+fvp-config = { path = "../config" }

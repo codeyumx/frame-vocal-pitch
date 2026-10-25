@@ -238,6 +238,31 @@ Acceptance (unit tests on synthetic 48 kHz signals):
 - Watch for external edits (stat poll at 2 Hz); apply changes live.
 - Every key has a default; unknown keys preserved is not required.
 
+Schema (all keys optional; missing → default; out-of-range numbers are clamped on load; unknown enum
+strings → default and a log line):
+
+| Table.key | Type | Default | Range / values |
+|---|---|---|---|
+| `hud.enabled` | bool | `true` | |
+| `hud.placement` | string | `"head"` | `head`, `left_wrist`, `right_wrist` |
+| `hud.display` | string | `"color"` | `color`, `detailed` |
+| `hud.size_m` | float | 0.05 | 0.02–0.20 |
+| `hud.opacity` | float | 0.9 | 0.1–1.0 |
+| `hud.nudge_x_m`, `hud.nudge_y_m`, `hud.nudge_z_m` | float | 0.0 | ±0.5; added to the placement's built-in offset; dashboard step 0.01 m |
+| `hud.fade_ms` | int | 300 | 0–2000 |
+| `target.preset` | string | `"feminine"` | `feminine`, `masculine`, `custom` |
+| `target.custom_low_hz`, `target.custom_high_hz` | float | 165, 255 | within detection span; low ≤ high − 10 |
+| `reminder.enabled` | bool | `false` | |
+| `reminder.delay_s` | float | 2.0 | 0.5–10 |
+| `reminder.pitch_hz` | float | 440 | 100–1000 |
+| `reminder.volume` | float | 0.5 | 0–1 |
+| `vocal_rest.minutes` | int | 0 | 0 = off, else 5–50 |
+| `audio.mic_mode` | string | `"bypass"` | `bypass`, `processed` (§6.3) |
+| `audio.detect_min_hz`, `audio.detect_max_hz` | float | 60, 500 | 40–1000, min ≤ max − 50 |
+| `audio.noise_floor_min_dbfs` | float | −60 | −90 to −20; lower clamp of the adaptive noise floor (§5) |
+
+Autostart is not a config key: it is the enabled state of the systemd user unit (§7).
+
 ### 6.2 Process lifecycle
 - Single instance: `flock` on `$XDG_RUNTIME_DIR/frame-vocal-pitch.lock` containing the PID.
   A second launch sends `SIGUSR1` to the running instance (toggles HUD and opens the dashboard tab)

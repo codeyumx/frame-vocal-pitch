@@ -1,0 +1,123 @@
+name: CI
+
+# Tag push (v1.2.3): test on x86_64, cross-build the aarch64 release, package it and attach the
+# tarball, SHA256SUMS and install.sh to the GitHub release (SPEC §7 and §8).
+# Pull request / main push: host tests only.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # glibc 2.39 baseline, same as the headset (see build/Dockerfile).
+  BUILD_IMAGE: frame-pitch-build:noble
+
+jobs:
+  test:
+    name: Host tests (x86_64)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev
+
+      - name: Versions
+        run: |
+          cargo --version
+          rustc --version
+          pkg-config --modversion libpipewire-0.3
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  release:
+    name: Release (aarch64)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev
+
+      - name: Versions
+        run: |
+          cargo --version
+          rustc --version
+          docker --version
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: Third-party license table is up to date
+        run: scripts/gen-third-party-licenses.sh --check
+
+      - name: Lint the packaging scripts
+        run: |
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck packaging/install.sh scripts/*.sh
+
+      - name: Installer dry run (fake payload, throwaway HOME)
+        run: scripts/test-install.sh
+
+      - name: Build cross-compile image
+        run: docker build --tag "$BUILD_IMAGE" build
+
+      - name: Cross-build aarch64 release
+        run: build/build-aarch64.sh -p frame-vocal-pitch --release
+
+      - name: Check the binary
+        run: |
+          binary=target/aarch64-unknown-linux-gnu/release/frame-vocal-pitch
+          test -x "$binary"
+          file "$binary"
+          file -b "$binary" | grep -q aarch64
+
+      - name: Package tarball and SHA256SUMS
+        run: |
+          # package.sh stamps the archive with the commit time, so re-running a release tag
+          # produces the same bytes.
+          version="${GITHUB_REF_NAME#v}"
+          scripts/package.sh "$version" \
+            target/aarch64-unknown-linux-gnu/release/frame-vocal-pitch
+          # The one-line install fetches releases/latest/download/install.sh, so the installer also
+          # lives at the release root, stamped with this release's version.
+          sed "s/@VERSION@/$version/g" packaging/install.sh >dist/install.sh
+          chmod 0755 dist/install.sh
+          (cd dist && sha256sum --check SHA256SUMS)
+          tar -tzf "dist/frame-vocal-pitch-$version-aarch64.tar.gz"
+          ls -l dist
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/frame-vocal-pitch-*-aarch64.tar.gz
+            dist/SHA256SUMS
+            dist/install.sh
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

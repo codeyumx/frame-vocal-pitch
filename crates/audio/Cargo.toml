@@ -1,0 +1,13 @@
+[package]
+name = "fvp-audio"
+description = "PipeWire capture (bypass/processed), mute tracking, reminder tone and probe for frame-vocal-pitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pipewire = "0.10"
+rtrb = "0.4"
+log = "0.4"
+
+[dev-dependencies]

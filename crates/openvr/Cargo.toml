@@ -1,0 +1,10 @@
+[package]
+name = "fvp-openvr"
+description = "OpenVR overlay + Vulkan texture submission for frame-vocal-pitch (runtime-loaded libopenvr_api.so)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+libloading = "0.8"

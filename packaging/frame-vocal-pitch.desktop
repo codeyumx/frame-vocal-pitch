@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Vocal Pitch
+Comment=Shows whether your voice is inside your target pitch range
+Exec=@EXEC@
+Icon=frame-vocal-pitch
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
