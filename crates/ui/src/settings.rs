@@ -668,10 +668,13 @@ fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, view: ViewState) {
 }
 
 fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, page: Page) {
-    let quit = R::new(W - M - 170.0, 14.0, 170.0, 48.0);
+    // Quit button with its one-line hint (§4.2) under it; the hint column is wider than the button
+    // so a ~30 % longer translation still fits at a readable size.
+    let quit = R::new(W - M - 170.0, 10.0, 170.0, 42.0);
+    let hint = R::new(W - M - 320.0, 54.0, 320.0, 20.0);
     ui.text(R::new(M, 14.0, TABS_X - M - 16.0, 48.0), STRINGS.title, 32.0, Weight::SemiBold, TEXT, Align::Left);
     ui.segmented(
-        R::new(TABS_X, 14.0, quit.x - 16.0 - TABS_X, 48.0),
+        R::new(TABS_X, 14.0, hint.x - 16.0 - TABS_X, 48.0),
         &[
             (STRINGS.tab_general, Control::Tab(Page::General), page == Page::General),
             (STRINGS.tab_resonance, Control::Tab(Page::Resonance), page == Page::Resonance),
@@ -681,6 +684,8 @@ fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, page: Page) {
     let hover = ui.widget(quit, Control::Quit, true);
     ui.fill(quit, 10.0, if hover { QUIT_HOVER } else { QUIT });
     ui.text(quit.inset(8.0), STRINGS.quit, 22.0, Weight::SemiBold, Rgba::hex(0xFFFFFF, 255), Align::Center);
+    let hint_text = if live.autostart { STRINGS.quit_hint_autostart } else { STRINGS.quit_hint };
+    ui.text(hint, hint_text, 16.0, Weight::Regular, TEXT_DIM, Align::Right);
 
     // Live strip.
     let strip = R::new(M, 78.0, W - 2.0 * M, 66.0);

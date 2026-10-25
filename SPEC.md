@@ -170,7 +170,10 @@ rendering; analysis keeps running only if needed for the vocal-rest timer.
 Created with `CreateDashboardOverlay` (title "Vocal Pitch", 256 px icon). Mouse input via
 `VROverlayInputMethod_Mouse` with `SetOverlayMouseScale` = panel pixel size; enable
 `SendVRSmoothScrollEvents`. Render only while the dashboard is visible and this tab is active.
-Panel 1200 × 800 px at ~2.8 m width.
+Panel 1200 × 800 px at ~2.8 m width. Set `VROverlayFlags_EnableControlBarClose` on the dashboard
+overlay so its control bar shows a close (×) button; the resulting `VREvent_OverlayClosed` for this
+overlay is handled exactly like the Quit button (clean shutdown, exit status 3). The process must never
+keep running after its tab was closed.
 
 Controls (each writes the config file immediately):
 - HUD on/off; placement; display mode; size; opacity; position nudges (up/down/left/right/closer/further).
@@ -182,7 +185,8 @@ Controls (each writes the config file immediately):
 - Autostart with SteamVR on/off (enables/disables the user unit).
 - Mic input: **"Bypass Valve processing (this app only)"** (default) / "Use processed mic". Below it a
   status line (§6.3) naming the node actually recorded from and any fallback reason.
-- Quit (exits with status 3 so the service does not restart it).
+- Quit (exits with status 3 so the service does not restart it). Label "Quit" plus a one-line hint
+  under it: "Stops the app until SteamVR starts again" when autostart is on, "Stops the app" otherwise.
 - Resonance (experimental), §5.1: off by default. Turning it on first shows the explanation card
   (§5.1 "User guidance") with "Turn on" / "Keep off". When on: "Record relaxed voice (10 s)",
   "Record target voice (10 s)" with progress and result, the current position as text, and a
@@ -337,7 +341,8 @@ Autostart is not a config key: it is the enabled state of the systemd user unit 
   A second launch sends `SIGUSR1` to the running instance (toggles HUD and opens the dashboard tab)
   and exits 0.
 - `SIGTERM`/`SIGINT`: clean shutdown (§3.1 order). `SIGUSR1`: toggle.
-- Exit status 3 = user chose Quit (service must not restart).
+- Exit status 3 = user chose Quit or closed the dashboard tab (service must not restart, and systemd
+  must record it as a normal stop, not a failure).
 - Logs to stderr (journald via the unit); `--verbose` raises level.
 
 ### 6.3 Mic input mode (`mic_mode = "bypass" | "processed"`)
@@ -441,6 +446,7 @@ ExecStart=%h/.local/bin/frame-vocal-pitch
 Restart=always
 RestartSec=5
 RestartPreventExitStatus=3
+SuccessExitStatus=3
 [Install]
 WantedBy=steamvr.service
 ```

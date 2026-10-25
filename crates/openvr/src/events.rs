@@ -60,6 +60,9 @@ pub enum Event {
     OverlayShown(OverlayHandle),
     /// The overlay was hidden (e.g. another dashboard tab was selected or the dashboard closed).
     OverlayHidden(OverlayHandle),
+    /// The user closed the overlay's dashboard tab with the control bar's close (×) button
+    /// (`VREvent_OverlayClosed`; needs [`crate::OverlayFlag::EnableControlBarClose`]).
+    OverlayClosed(OverlayHandle),
     DashboardActivated,
     DashboardDeactivated,
     /// `VREvent_TrackedDeviceActivated` for the given device index.
@@ -144,6 +147,7 @@ pub(crate) fn decode(raw: &VREvent, source: Source) -> Option<Event> {
         }),
         ffi::VR_EVENT_OVERLAY_SHOWN => Some(Event::OverlayShown(overlay)),
         ffi::VR_EVENT_OVERLAY_HIDDEN => Some(Event::OverlayHidden(overlay)),
+        ffi::VR_EVENT_OVERLAY_CLOSED => Some(Event::OverlayClosed(overlay)),
         _ => None,
     }
 }
@@ -285,6 +289,8 @@ mod tests {
     fn overlay_visibility_events() {
         assert_eq!(decode(&raw(500, 0, &[]), OV), Some(Event::OverlayShown(H)));
         assert_eq!(decode(&raw(501, 0, &[]), OV), Some(Event::OverlayHidden(H)));
+        assert_eq!(decode(&raw(534, 0, &[]), OV), Some(Event::OverlayClosed(H)));
+        assert_eq!(decode(&raw(534, 0, &[]), Source::System), None);
     }
 
     #[test]

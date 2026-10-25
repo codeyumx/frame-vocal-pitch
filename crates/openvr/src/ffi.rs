@@ -68,6 +68,7 @@ pub const VR_OVERLAY_FLAGS_NO_DASHBOARD_TAB: i32 = 8;
 pub const VR_OVERLAY_FLAGS_SEND_VR_DISCRETE_SCROLL_EVENTS: i32 = 64;
 pub const VR_OVERLAY_FLAGS_SEND_VR_SMOOTH_SCROLL_EVENTS: i32 = 131_072;
 pub const VR_OVERLAY_FLAGS_IS_PREMULTIPLIED: i32 = 2_097_152;
+pub const VR_OVERLAY_FLAGS_ENABLE_CONTROL_BAR_CLOSE: i32 = 33_554_432;
 
 // EVRMouseButton
 pub const VR_MOUSE_BUTTON_LEFT: u32 = 1;
@@ -85,6 +86,7 @@ pub const VR_EVENT_SCROLL_DISCRETE: u32 = 305;
 pub const VR_EVENT_SCROLL_SMOOTH: u32 = 309;
 pub const VR_EVENT_OVERLAY_SHOWN: u32 = 500;
 pub const VR_EVENT_OVERLAY_HIDDEN: u32 = 501;
+pub const VR_EVENT_OVERLAY_CLOSED: u32 = 534;
 pub const VR_EVENT_DASHBOARD_ACTIVATED: u32 = 502;
 pub const VR_EVENT_DASHBOARD_DEACTIVATED: u32 = 503;
 pub const VR_EVENT_QUIT: u32 = 700;
@@ -580,6 +582,10 @@ mod tests {
                 VR_OVERLAY_FLAGS_IS_PREMULTIPLIED as i64,
             ),
             (
+                "VROverlayFlags_EnableControlBarClose",
+                VR_OVERLAY_FLAGS_ENABLE_CONTROL_BAR_CLOSE as i64,
+            ),
+            (
                 "EVRMouseButton_VRMouseButton_Left",
                 VR_MOUSE_BUTTON_LEFT as i64,
             ),
@@ -619,6 +625,10 @@ mod tests {
             (
                 "EVREventType_VREvent_OverlayHidden",
                 VR_EVENT_OVERLAY_HIDDEN as i64,
+            ),
+            (
+                "EVREventType_VREvent_OverlayClosed",
+                VR_EVENT_OVERLAY_CLOSED as i64,
             ),
             (
                 "EVREventType_VREvent_DashboardActivated",

@@ -107,6 +107,9 @@ pub enum OverlayFlag {
     SendVRDiscreteScrollEvents,
     IsPremultiplied,
     NoDashboardTab,
+    /// Shows a close (×) button in the dashboard control bar; pressing it sends
+    /// `VREvent_OverlayClosed`.
+    EnableControlBarClose,
 }
 
 impl OverlayFlag {
@@ -118,6 +121,7 @@ impl OverlayFlag {
             }
             Self::IsPremultiplied => ffi::VR_OVERLAY_FLAGS_IS_PREMULTIPLIED,
             Self::NoDashboardTab => ffi::VR_OVERLAY_FLAGS_NO_DASHBOARD_TAB,
+            Self::EnableControlBarClose => ffi::VR_OVERLAY_FLAGS_ENABLE_CONTROL_BAR_CLOSE,
         }
     }
 }

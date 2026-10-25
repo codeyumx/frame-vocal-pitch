@@ -160,6 +160,7 @@ struct Session {
     submitter: TextureSubmitter,
     hud: OverlayHandle,
     dashboard: OverlayHandle,
+    thumbnail: OverlayHandle,
     applied: Option<Applied>,
     shown: bool,
     dashboard_active: bool,
@@ -681,6 +682,8 @@ impl App {
         vr.set_input_method(dashboard, InputMethod::Mouse)?;
         vr.set_mouse_scale(dashboard, SETTINGS_WIDTH_PX as f32, SETTINGS_HEIGHT_PX as f32)?;
         vr.set_flag(dashboard, OverlayFlag::SendVRSmoothScrollEvents, true)?;
+        // SPEC §4.2: the control bar's close (×) button quits like the Quit button.
+        vr.set_flag(dashboard, OverlayFlag::EnableControlBarClose, true)?;
         match icon_path() {
             Some(path) => {
                 if let Err(e) = vr.set_thumbnail_from_file(thumbnail, &path) {
@@ -697,6 +700,7 @@ impl App {
             submitter,
             hud,
             dashboard,
+            thumbnail,
             applied: None,
             shown: false,
             dashboard_active: false,
@@ -724,6 +728,11 @@ impl App {
             };
             session.vr.poll_events_into(&mut events);
             for event in events {
+                if closes_dashboard(&event, session.dashboard, session.thumbnail) {
+                    log::info!("dashboard tab closed from its control bar");
+                    actions.push(Action::Quit);
+                    continue;
+                }
                 match event {
                     Event::Quit => {
                         restart = true;
@@ -1136,6 +1145,12 @@ fn icon_path() -> Option<PathBuf> {
     next_to_exe.filter(|path| path.is_file())
 }
 
+/// Whether `event` is the user closing this app's dashboard tab (main overlay or its thumbnail);
+/// SPEC §4.2 treats that exactly like the Quit button.
+fn closes_dashboard(event: &Event, dashboard: OverlayHandle, thumbnail: OverlayHandle) -> bool {
+    matches!(event, Event::OverlayClosed(overlay) if *overlay == dashboard || *overlay == thumbnail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1165,18 @@ mod tests {
             muted: false,
             healthy: true,
         }
+    }
+
+    #[test]
+    fn closing_the_dashboard_tab_quits() {
+        let dashboard = OverlayHandle(1);
+        let thumbnail = OverlayHandle(2);
+        let other = OverlayHandle(3);
+        assert!(closes_dashboard(&Event::OverlayClosed(dashboard), dashboard, thumbnail));
+        assert!(closes_dashboard(&Event::OverlayClosed(thumbnail), dashboard, thumbnail));
+        assert!(!closes_dashboard(&Event::OverlayClosed(other), dashboard, thumbnail));
+        assert!(!closes_dashboard(&Event::OverlayHidden(dashboard), dashboard, thumbnail));
+        assert!(!closes_dashboard(&Event::Quit, dashboard, thumbnail));
     }
 
     #[test]

@@ -6,6 +6,9 @@
 pub struct Strings {
     pub title: &'static str,
     pub quit: &'static str,
+    /// One-line hint under Quit while autostart is on / off.
+    pub quit_hint_autostart: &'static str,
+    pub quit_hint: &'static str,
     pub on: &'static str,
     pub off: &'static str,
     pub hz: &'static str,
@@ -128,6 +131,8 @@ pub struct Strings {
 pub const EN: Strings = Strings {
     title: "Vocal Pitch",
     quit: "Quit",
+    quit_hint_autostart: "Stops the app until SteamVR starts again",
+    quit_hint: "Stops the app",
     on: "On",
     off: "Off",
     hz: "Hz",
