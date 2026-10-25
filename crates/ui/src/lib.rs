@@ -20,7 +20,7 @@ pub use hud::{
 pub use icon::{icon_png, render_icon};
 pub use preview::render_all_png;
 pub use settings::{
-    steps, update_status_text, Action, CalibStatus, CalibWhich, LiveInfo, ResonanceLive,
+    steps, update_status_text, Action, LiveInfo, ResonanceLive,
     SettingsPanel, UpdateLive, UpdateStatus, SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
     UPDATE_CONFIRM_WINDOW,
 };

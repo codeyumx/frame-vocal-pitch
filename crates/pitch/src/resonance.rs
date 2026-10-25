@@ -1,6 +1,6 @@
 //! Resonance feedback (SPEC §5.1): formant spacing ΔF of voiced frames,
-//! a windowed median for display, calibration recordings and the position
-//! of the current value between the two calibrations.
+//! a windowed median for display and the position of the current value
+//! between the user's two reference values (relaxed and target ΔF).
 //!
 //! Per frame: pre-emphasis, Hamming window, autocorrelation linear prediction
 //! (Levinson–Durbin, order [`LPC_ORDER`]), roots of the prediction polynomial
@@ -12,9 +12,8 @@
 //! Nothing here allocates per hop once the first frame has been analysed.
 
 use crate::params::{
-    CALIBRATION_MIN_ACCEPTED_S, CALIBRATION_MIN_SEPARATION, CALIBRATION_S,
     FORMANT_MAX_BANDWIDTH_HZ, FORMANT_MAX_HZ, FORMANT_MIN_HZ, HOP_S, LPC_ORDER, PRE_EMPHASIS,
-    RESONANCE_MAX_F0_HZ, RESONANCE_MEDIAN_INTERVAL_S, RESONANCE_MIN_ACCEPTED_S,
+    RESONANCE_MAX_F0_HZ, RESONANCE_MEDIAN_INTERVAL_S, RESONANCE_MIN_ACCEPTED_S, RESONANCE_MIN_SEPARATION,
     RESONANCE_SMOOTHING_S, RESONANCE_WINDOW_MAX_S, RESONANCE_WINDOW_MIN_S, RESONANCE_WINDOW_S,
     TIME_EPS,
 };
@@ -22,7 +21,6 @@ use crate::yin::{AnalysisFrame, Hop};
 use realfft::num_complex::Complex;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
-use std::fmt;
 
 type C64 = Complex<f64>;
 
@@ -340,7 +338,7 @@ impl ResonanceTracker {
     }
 
     /// Feeds one hop with its analysis frame. Returns the frame's ΔF when it
-    /// was accepted (useful to feed a [`Calibration`] alongside).
+    /// was accepted.
     pub fn update(&mut self, hop: &Hop, frame: AnalysisFrame<'_>) -> Option<f32> {
         let df = self.analyzer.measure(hop, frame);
         let oldest = hop.t_s - f64::from(self.window_s) + TIME_EPS;
@@ -387,9 +385,9 @@ impl ResonanceTracker {
         self.smoothed
     }
 
-    /// Display state for the given calibration: [`position`] of the smoothed
-    /// reading.
-    pub fn state(&self, relaxed_df_hz: Option<f32>, target_df_hz: Option<f32>) -> ResonanceState {
+    /// Display state for the given reference values: [`position`] of the
+    /// smoothed reading.
+    pub fn state(&self, relaxed_df_hz: f32, target_df_hz: f32) -> ResonanceState {
         position(self.smoothed, relaxed_df_hz, target_df_hz)
     }
 }
@@ -397,128 +395,29 @@ impl ResonanceTracker {
 /// What the resonance indicator can show.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ResonanceState {
-    /// Calibrated, but fewer than 2 s of accepted frames in the window.
+    /// Fewer than 2 s of accepted frames in the window.
     Gathering,
-    /// Relaxed or target calibration missing.
-    Uncalibrated,
-    /// The two calibrations are less than 5 % apart.
+    /// The two reference values are less than 5 % apart.
     TooSimilar,
     /// `p = (R − relaxed) / (target − relaxed)`, unclamped (0 = relaxed,
     /// 1 = target); the display clamps it to −0.25…1.25.
     Position(f32),
 }
 
-/// True when the calibrations differ by less than 5 % of `relaxed`.
+/// True when the reference values differ by less than 5 % of `relaxed`.
 pub fn too_similar(relaxed_df_hz: f32, target_df_hz: f32) -> bool {
-    (target_df_hz - relaxed_df_hz).abs() < CALIBRATION_MIN_SEPARATION * relaxed_df_hz
+    (target_df_hz - relaxed_df_hz).abs() < RESONANCE_MIN_SEPARATION * relaxed_df_hz
 }
 
 /// Maps a reading `r` (normally [`ResonanceTracker::smoothed`]) onto the two
-/// calibrations. Precedence: missing calibration, too similar, gathering.
-pub fn position(
-    r: Option<f32>,
-    relaxed_df_hz: Option<f32>,
-    target_df_hz: Option<f32>,
-) -> ResonanceState {
-    let (Some(relaxed), Some(target)) = (relaxed_df_hz, target_df_hz) else {
-        return ResonanceState::Uncalibrated;
-    };
-    if too_similar(relaxed, target) {
+/// reference values. Precedence: too similar, gathering.
+pub fn position(r: Option<f32>, relaxed_df_hz: f32, target_df_hz: f32) -> ResonanceState {
+    if too_similar(relaxed_df_hz, target_df_hz) {
         return ResonanceState::TooSimilar;
     }
     match r {
         None => ResonanceState::Gathering,
-        Some(r) => ResonanceState::Position((r - relaxed) / (target - relaxed)),
-    }
-}
-
-/// A calibration recording failed.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CalibError {
-    /// Fewer than 3 s of frames were accepted.
-    NotEnoughSpeech {
-        /// Seconds of accepted frames that were recorded.
-        accepted_s: f32,
-    },
-}
-
-impl fmt::Display for CalibError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CalibError::NotEnoughSpeech { .. } => f.write_str(
-                "Not enough clear speech — try again in a quiet place, speaking normally",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CalibError {}
-
-/// One 10 s calibration recording. Feed the per-hop result of
-/// [`ResonanceTracker::update`] (or [`FormantAnalyzer::measure`]) to
-/// [`Calibration::push`] for every hop until [`Calibration::is_done`].
-#[derive(Debug, Clone)]
-pub struct Calibration {
-    hops: usize,
-    total_hops: usize,
-    values: Vec<f32>,
-}
-
-impl Default for Calibration {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Calibration {
-    /// Starts a recording; allocates room for every hop of it.
-    pub fn new() -> Self {
-        let total_hops = hops(CALIBRATION_S);
-        Self {
-            hops: 0,
-            total_hops,
-            values: Vec::with_capacity(total_hops),
-        }
-    }
-
-    /// Records one hop: `Some(ΔF)` if its frame was accepted. Ignored once
-    /// the recording is done.
-    pub fn push(&mut self, df_hz: Option<f32>) {
-        if self.is_done() {
-            return;
-        }
-        self.hops += 1;
-        if let Some(df) = df_hz {
-            self.values.push(df);
-        }
-    }
-
-    /// Fraction of the 10 s recorded, 0–1.
-    pub fn progress(&self) -> f32 {
-        self.hops as f32 / self.total_hops as f32
-    }
-
-    /// True once 10 s of hops have been pushed.
-    pub fn is_done(&self) -> bool {
-        self.hops >= self.total_hops
-    }
-
-    /// Seconds of accepted frames so far.
-    pub fn accepted_s(&self) -> f32 {
-        (self.values.len() as f64 * HOP_S) as f32
-    }
-
-    /// The stored value: median ΔF of the accepted frames, or an error if
-    /// fewer than 3 s were accepted. May be called before the recording is
-    /// done (it then judges what was recorded so far).
-    pub fn finish(mut self) -> Result<f32, CalibError> {
-        let accepted_s = self.values.len() as f64 * HOP_S;
-        if accepted_s + TIME_EPS < CALIBRATION_MIN_ACCEPTED_S {
-            return Err(CalibError::NotEnoughSpeech {
-                accepted_s: accepted_s as f32,
-            });
-        }
-        median(&mut self.values).ok_or(CalibError::NotEnoughSpeech { accepted_s: 0.0 })
+        Some(r) => ResonanceState::Position((r - relaxed_df_hz) / (target_df_hz - relaxed_df_hz)),
     }
 }
 

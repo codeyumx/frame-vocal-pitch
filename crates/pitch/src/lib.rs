@@ -6,8 +6,8 @@
 //! classification hysteresis, `no_voice` timeout).
 //!
 //! [`ReminderTimer`] and [`VocalRest`] implement the two time-based features
-//! that consume the tracker output. [`ResonanceTracker`] and [`Calibration`]
-//! implement the experimental resonance feedback (SPEC §5.1) on the frames
+//! that consume the tracker output. [`ResonanceTracker`]
+//! implements the experimental resonance feedback (SPEC §5.1) on the frames
 //! that [`Detector::push_with`] exposes. All tunable constants live in
 //! [`params`].
 //!
@@ -30,7 +30,7 @@ pub use analyze::{analyze, bench, bench_resonance};
 pub use params::PitchParams;
 pub use reminder::ReminderTimer;
 pub use resonance::{
-    accepts, formant_spacing, position, too_similar, CalibError, Calibration, FormantAnalyzer,
+    accepts, formant_spacing, position, too_similar, FormantAnalyzer,
     Formants, ResonanceState, ResonanceTracker,
 };
 pub use tracker::{Class, PitchState, Tracker};

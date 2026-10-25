@@ -54,7 +54,6 @@ pub struct Config {
 #[serde(default)]
 pub struct Hud {
     pub enabled: bool,
-    pub placement: Placement,
     pub display: DisplayMode,
     #[serde(serialize_with = "ser_f32")]
     pub size_m: f32,
@@ -74,7 +73,6 @@ impl Default for Hud {
     fn default() -> Self {
         Hud {
             enabled: true,
-            placement: Placement::Head,
             display: DisplayMode::Color,
             size_m: 0.05,
             opacity: 0.9,
@@ -95,6 +93,10 @@ pub struct Target {
     pub custom_low_hz: f32,
     #[serde(serialize_with = "ser_f32")]
     pub custom_high_hz: f32,
+    /// Width of the yellow/orange "near" zone just outside the band, Hz; beyond it the tile is
+    /// red. 0 = no near zone.
+    #[serde(serialize_with = "ser_f32")]
+    pub near_hz: f32,
 }
 
 impl Default for Target {
@@ -103,6 +105,7 @@ impl Default for Target {
             preset: Preset::Feminine,
             custom_low_hz: 165.0,
             custom_high_hz: 255.0,
+            near_hz: 10.0,
         }
     }
 }
@@ -144,7 +147,6 @@ pub struct VocalRest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {
-    pub mic_mode: MicMode,
     #[serde(serialize_with = "ser_f32")]
     pub detect_min_hz: f32,
     #[serde(serialize_with = "ser_f32")]
@@ -156,7 +158,6 @@ pub struct Audio {
 impl Default for Audio {
     fn default() -> Self {
         Audio {
-            mic_mode: MicMode::Bypass,
             detect_min_hz: 60.0,
             detect_max_hz: 500.0,
             noise_floor_min_dbfs: -60.0,
@@ -173,18 +174,12 @@ pub struct Resonance {
     /// Median window for the displayed value, seconds (4–20).
     #[serde(serialize_with = "ser_f32")]
     pub window_s: f32,
-    /// Calibrated formant spacing of the relaxed voice, Hz; `None` = not calibrated.
-    #[serde(
-        serialize_with = "ser_opt_f32",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub relaxed_df_hz: Option<f32>,
-    /// Calibrated formant spacing of the target voice, Hz; `None` = not calibrated.
-    #[serde(
-        serialize_with = "ser_opt_f32",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub target_df_hz: Option<f32>,
+    /// Reference formant spacing of the relaxed voice, Hz (500–2000).
+    #[serde(serialize_with = "ser_f32")]
+    pub relaxed_df_hz: f32,
+    /// Reference formant spacing of the target voice, Hz (500–2000).
+    #[serde(serialize_with = "ser_f32")]
+    pub target_df_hz: f32,
 }
 
 impl Default for Resonance {
@@ -192,8 +187,8 @@ impl Default for Resonance {
         Resonance {
             enabled: false,
             window_s: 8.0,
-            relaxed_df_hz: None,
-            target_df_hz: None,
+            relaxed_df_hz: 1000.0,
+            target_df_hz: 1150.0,
         }
     }
 }
@@ -279,15 +274,6 @@ macro_rules! string_enum {
 }
 
 string_enum!(
-    /// `hud.placement`
-    Placement, "hud.placement", default Head, {
-        Head => "head",
-        LeftWrist => "left_wrist",
-        RightWrist => "right_wrist",
-    }
-);
-
-string_enum!(
     /// `hud.display`
     DisplayMode, "hud.display", default Color, {
         Color => "color",
@@ -301,14 +287,6 @@ string_enum!(
         Feminine => "feminine",
         Masculine => "masculine",
         Custom => "custom",
-    }
-);
-
-string_enum!(
-    /// `audio.mic_mode` (SPEC §6.3)
-    MicMode, "audio.mic_mode", default Bypass, {
-        Bypass => "bypass",
-        Processed => "processed",
     }
 );
 
@@ -327,8 +305,6 @@ impl Config {
     /// Pair rules: `detect_min_hz ≤ detect_max_hz − 50` (raises the max, or lowers the min at the
     /// top of the range); custom band inside the detection span with `low ≤ high − 10` (raises the
     /// high, or lowers the low at the top of the span); `vocal_rest.minutes` 1–4 becomes 5.
-    /// A resonance calibration value that is not a finite positive number becomes "not
-    /// calibrated" (`None`).
     pub fn clamp(&mut self) {
         let d = Config::default();
 
@@ -418,6 +394,7 @@ impl Config {
             hi,
             "target.custom_low_hz/custom_high_hz",
         );
+        t.near_hz = clamp_f(t.near_hz, 0.0, 50.0, d.target.near_hz, "target.near_hz");
 
         let res = &mut self.resonance;
         res.window_s = clamp_f(
@@ -427,8 +404,10 @@ impl Config {
             d.resonance.window_s,
             "resonance.window_s",
         );
-        res.relaxed_df_hz = valid_calibration(res.relaxed_df_hz, "resonance.relaxed_df_hz");
-        res.target_df_hz = valid_calibration(res.target_df_hz, "resonance.target_df_hz");
+        res.relaxed_df_hz =
+            clamp_f(res.relaxed_df_hz, 500.0, 2000.0, d.resonance.relaxed_df_hz, "resonance.relaxed_df_hz");
+        res.target_df_hz =
+            clamp_f(res.target_df_hz, 500.0, 2000.0, d.resonance.target_df_hz, "resonance.target_df_hz");
     }
 }
 
@@ -438,16 +417,6 @@ fn clamp_f(v: f32, lo: f32, hi: f32, default: f32, key: &str) -> f32 {
         log::debug!("config: {key} {v} clamped to {out}");
     }
     out
-}
-
-fn valid_calibration(v: Option<f32>, key: &str) -> Option<f32> {
-    match v {
-        Some(x) if !(x.is_finite() && x > 0.0) => {
-            log::debug!("config: {key} {x} is not a valid calibration; treated as absent");
-            None
-        }
-        v => v,
-    }
 }
 
 /// Makes `low ≤ high − gap`, preferring to raise `high`; at the `top` limit lowers `low` instead.
@@ -469,14 +438,6 @@ fn enforce_gap(low: f32, high: f32, gap: f32, top: f32, key: &str) -> (f32, f32)
 fn ser_f32<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
     let shortest: f64 = v.to_string().parse().unwrap_or(f64::from(*v));
     s.serialize_f64(shortest)
-}
-
-/// [`ser_f32`] for optional values; `None` is skipped by `skip_serializing_if`.
-fn ser_opt_f32<S: Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
-    match v {
-        Some(x) => ser_f32(x, s),
-        None => s.serialize_none(),
-    }
 }
 
 /// Deserializes a non-negative integer, saturating negative values to 0 and huge ones to
@@ -744,7 +705,6 @@ mod tests {
     fn defaults_match_spec() {
         let c = Config::default();
         assert!(c.hud.enabled);
-        assert_eq!(c.hud.placement, Placement::Head);
         assert_eq!(c.hud.display, DisplayMode::Color);
         assert_eq!(c.hud.size_m, 0.05);
         assert_eq!(c.hud.opacity, 0.9);
@@ -763,7 +723,6 @@ mod tests {
         assert_eq!(c.reminder.pitch_hz, 440.0);
         assert_eq!(c.reminder.volume, 0.5);
         assert_eq!(c.vocal_rest.minutes, 0);
-        assert_eq!(c.audio.mic_mode, MicMode::Bypass);
         assert_eq!(
             (c.audio.detect_min_hz, c.audio.detect_max_hz),
             (60.0, 500.0)
@@ -772,13 +731,9 @@ mod tests {
         assert_eq!(c.resonance, Resonance::default());
         assert!(!c.resonance.enabled);
         assert_eq!(c.resonance.window_s, 8.0);
-        assert_eq!(c.resonance.relaxed_df_hz, None);
-        assert_eq!(c.resonance.target_df_hz, None);
+        assert_eq!(c.resonance.relaxed_df_hz, 1000.0);
+        assert_eq!(c.resonance.target_df_hz, 1150.0);
         assert!(c.update.check);
-        assert!(
-            !to_toml(&c).contains("_df_hz"),
-            "absent calibration is omitted"
-        );
         assert_eq!(c.band(), (165.0, 255.0));
 
         // Defaults are already within range.
@@ -802,31 +757,30 @@ mod tests {
 
     #[test]
     fn partial_file_and_enums() {
+        // `hud.placement` and `audio.mic_mode` (removed after 0.3.0) in older files are ignored.
         let c = parse(
             "[hud]\nplacement = \"left_wrist\"\ndisplay = \"detailed\"\nsize_m = 0.1\n\
-             [target]\npreset = \"custom\"\n[audio]\nmic_mode = \"processed\"\n",
+             [target]\npreset = \"custom\"\n[audio]\nmic_mode = \"bypass\"\ndetect_min_hz = 70\n",
         )
         .unwrap();
-        assert_eq!(c.hud.placement, Placement::LeftWrist);
         assert_eq!(c.hud.display, DisplayMode::Detailed);
         assert_eq!(c.hud.size_m, 0.1);
         assert!(c.hud.enabled);
         assert_eq!(c.target.preset, Preset::Custom);
-        assert_eq!(c.audio.mic_mode, MicMode::Processed);
+        assert_eq!(c.audio.detect_min_hz, 70.0);
         assert_eq!(c.reminder, Reminder::default());
+        let text = to_toml(&c);
+        assert!(!text.contains("mic_mode") && !text.contains("placement"), "{text}");
     }
 
     #[test]
     fn unknown_enum_strings_fall_back_to_default() {
         let c = parse(
-            "[hud]\nplacement = \"forehead\"\ndisplay = \"x\"\n[target]\npreset = \"alto\"\n\
-             [audio]\nmic_mode = \"raw\"\n",
+            "[hud]\ndisplay = \"x\"\n[target]\npreset = \"alto\"\n",
         )
         .unwrap();
-        assert_eq!(c.hud.placement, Placement::Head);
         assert_eq!(c.hud.display, DisplayMode::Color);
         assert_eq!(c.target.preset, Preset::Feminine);
-        assert_eq!(c.audio.mic_mode, MicMode::Bypass);
     }
 
     #[test]
@@ -905,13 +859,13 @@ mod tests {
         .unwrap();
         assert!(c.resonance.enabled);
         assert_eq!(c.resonance.window_s, 4.0);
-        assert_eq!(c.resonance.relaxed_df_hz, None);
-        assert_eq!(c.resonance.target_df_hz, None);
+        assert_eq!(c.resonance.relaxed_df_hz, 500.0);
+        assert_eq!(c.resonance.target_df_hz, 1150.0, "NaN falls back to the default");
 
-        let c = parse("[resonance]\nwindow_s = 60\nrelaxed_df_hz = 1000\n").unwrap();
+        let c = parse("[resonance]\nwindow_s = 60\nrelaxed_df_hz = 1031.5\ntarget_df_hz = 9000\n").unwrap();
         assert_eq!(c.resonance.window_s, 20.0);
-        assert_eq!(c.resonance.relaxed_df_hz, Some(1000.0));
-        assert_eq!(c.resonance.target_df_hz, None);
+        assert_eq!(c.resonance.relaxed_df_hz, 1031.5);
+        assert_eq!(c.resonance.target_df_hz, 2000.0);
         assert_eq!(
             parse("[resonance]\nwindow_s = nan\n")
                 .unwrap()
@@ -956,7 +910,6 @@ mod tests {
     fn round_trip() {
         let mut c = Config::default();
         c.hud.enabled = false;
-        c.hud.placement = Placement::RightWrist;
         c.hud.display = DisplayMode::Detailed;
         c.hud.size_m = 0.07;
         c.hud.opacity = 0.35;
@@ -972,14 +925,13 @@ mod tests {
         c.reminder.pitch_hz = 660.0;
         c.reminder.volume = 0.25;
         c.vocal_rest.minutes = 20;
-        c.audio.mic_mode = MicMode::Processed;
         c.audio.detect_min_hz = 70.0;
         c.audio.detect_max_hz = 450.0;
         c.audio.noise_floor_min_dbfs = -55.0;
         c.resonance.enabled = true;
         c.resonance.window_s = 12.5;
-        c.resonance.relaxed_df_hz = Some(1031.25);
-        c.resonance.target_df_hz = Some(1187.4);
+        c.resonance.relaxed_df_hz = 1031.25;
+        c.resonance.target_df_hz = 1187.4;
         c.update.check = false;
 
         let text = to_toml(&c);
@@ -987,7 +939,6 @@ mod tests {
             text.contains("size_m = 0.07\n"),
             "shortest float form:\n{text}"
         );
-        assert!(text.contains("placement = \"right_wrist\""));
         assert!(text.contains("[update]\ncheck = false\n"), "{text}");
         assert_eq!(parse(&text).unwrap(), c);
 

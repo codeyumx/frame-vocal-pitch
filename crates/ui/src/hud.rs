@@ -47,6 +47,11 @@ const LABEL_BG: Rgba = Rgba::hex(0x141414, 225);
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum HudState {
     InRange,
+    /// Below the band, within the near zone: raise the voice.
+    TooLow,
+    /// Above the band, within the near zone: lower the voice.
+    TooHigh,
+    /// Further outside the band than the near zone, either side.
     OutOfRange,
     NoVoice,
     Muted,
@@ -58,23 +63,25 @@ impl HudState {
     pub(crate) fn color(self) -> Rgba {
         match self {
             HudState::InRange => Rgba::hex(0x2EBD59, 255),
+            HudState::TooLow => Rgba::hex(0xF2C94C, 255),
+            HudState::TooHigh => Rgba::hex(0xF07F2E, 255),
             HudState::OutOfRange => Rgba::hex(0xD9433B, 255),
             HudState::NoVoice => Rgba::hex(0x202020, 153),
             HudState::Muted => Rgba::hex(0x6B6B6B, 255),
-            HudState::NoMic => Rgba::hex(0xE0A030, 255),
+            HudState::NoMic => Rgba::hex(0x3D7DD8, 255),
         }
     }
 
     /// Foreground (glyph/text) colour on this state's tile.
     pub(crate) fn foreground(self) -> Rgba {
         match self {
-            HudState::NoMic => Rgba::hex(0x1E1A12, 255),
+            HudState::TooLow | HudState::TooHigh => Rgba::hex(0x1E1A12, 255),
             _ => Rgba::hex(0xFFFFFF, 255),
         }
     }
 
-    fn voiced(self) -> bool {
-        matches!(self, HudState::InRange | HudState::OutOfRange)
+    pub(crate) fn voiced(self) -> bool {
+        matches!(self, HudState::InRange | HudState::TooLow | HudState::TooHigh | HudState::OutOfRange)
     }
 }
 
@@ -86,12 +93,8 @@ pub const RESONANCE_DISPLAY_RANGE: (f32, f32) = (-0.25, 1.25);
 pub enum ResonanceView {
     /// Fewer than 2 s of accepted frames in the window: dim bar, no marker.
     Gathering,
-    /// One or both calibrations missing: dim bar, "Calibrate in settings".
-    Uncalibrated,
-    /// The two calibrations are less than 5 % apart: dim bar, no marker.
+    /// The two reference values are less than 5 % apart: dim bar, no marker.
     TooSimilar,
-    /// The active mic mode is processed (§6.3): dim bar, no marker.
-    NeedsBypass,
     /// Smoothed position p (0 = relaxed, 1 = target), raw; drawn clamped to
     /// [`RESONANCE_DISPLAY_RANGE`]. Non-finite values are shown like [`ResonanceView::Gathering`].
     Position(f32),
@@ -141,17 +144,13 @@ enum ResKey {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ResMessage {
-    Uncalibrated,
     TooSimilar,
-    NeedsBypass,
 }
 
 impl ResMessage {
     fn text(self) -> &'static str {
         match self {
-            ResMessage::Uncalibrated => STRINGS.hud_res_uncalibrated,
             ResMessage::TooSimilar => STRINGS.hud_res_too_similar,
-            ResMessage::NeedsBypass => STRINGS.hud_res_needs_bypass,
         }
     }
 }
@@ -293,9 +292,7 @@ impl Hud {
                     ResKey::Marker((res_y_of(p) * 2.0).round() as i32)
                 }
                 ResonanceView::Position(_) | ResonanceView::Gathering => ResKey::Gathering,
-                ResonanceView::Uncalibrated => ResKey::Message(ResMessage::Uncalibrated),
                 ResonanceView::TooSimilar => ResKey::Message(ResMessage::TooSimilar),
-                ResonanceView::NeedsBypass => ResKey::Message(ResMessage::NeedsBypass),
             });
             let bar = BarGeom::new(view.span, res != ResKey::Off);
             let f0 = view.f0_hz.filter(|f| f.is_finite() && *f > 0.0);
@@ -617,8 +614,6 @@ mod tests {
         assert!(hud.render(&v, t0).is_some());
         v.resonance = Some(ResonanceView::Position(0.5));
         assert!(hud.render(&v, t0).is_none());
-        v.resonance = Some(ResonanceView::Uncalibrated);
-        assert!(hud.render(&v, t0).is_none());
     }
 
     #[test]
@@ -645,7 +640,7 @@ mod tests {
         assert!(hud.render(&v, t0).is_some());
         v.resonance = Some(ResonanceView::Position(-9.0));
         assert!(hud.render(&v, t0).is_none(), "clamped to -0.25");
-        for state in [ResonanceView::Uncalibrated, ResonanceView::TooSimilar, ResonanceView::NeedsBypass] {
+        for state in [ResonanceView::TooSimilar] {
             v.resonance = Some(state);
             assert!(hud.render(&v, t0).is_some(), "{state:?}");
             assert!(hud.render(&v, t0).is_none(), "{state:?}");
@@ -694,9 +689,7 @@ mod tests {
             off.render(&view(state, DisplayMode::Detailed), t0).unwrap();
             for res in [
                 ResonanceView::Gathering,
-                ResonanceView::Uncalibrated,
                 ResonanceView::TooSimilar,
-                ResonanceView::NeedsBypass,
                 ResonanceView::Position(1.1),
             ] {
                 let mut on = Hud::new();
@@ -708,8 +701,15 @@ mod tests {
         }
     }
 
-    const STATES_UNDER_TEST: [HudState; 5] =
-        [HudState::InRange, HudState::OutOfRange, HudState::NoVoice, HudState::Muted, HudState::NoMic];
+    const STATES_UNDER_TEST: [HudState; 7] = [
+        HudState::InRange,
+        HudState::TooLow,
+        HudState::TooHigh,
+        HudState::OutOfRange,
+        HudState::NoVoice,
+        HudState::Muted,
+        HudState::NoMic,
+    ];
 
     #[test]
     fn first_render_is_some_then_none_when_unchanged() {
@@ -750,7 +750,7 @@ mod tests {
         let t0 = Instant::now();
         let mut v = view(HudState::InRange, DisplayMode::Color);
         hud.render(&v, t0).unwrap();
-        v.state = HudState::OutOfRange;
+        v.state = HudState::TooLow;
         assert!(hud.render(&v, t0).is_some(), "state change renders");
         assert!(hud.animating());
         let mut t = t0;
@@ -766,7 +766,7 @@ mod tests {
         assert!(hud.render(&v, t + Duration::from_millis(11)).is_none());
         // Final colour is the target colour at the tile centre.
         let px = hud.pixmap.pixel(TILE.cx() as u32, TILE.y as u32 + 10).unwrap();
-        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0xD9, 0x43, 0x3B, 255));
+        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0xF2, 0xC9, 0x4C, 255));
     }
 
     #[test]

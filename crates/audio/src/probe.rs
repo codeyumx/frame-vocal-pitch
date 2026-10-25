@@ -1,5 +1,4 @@
-//! `--probe` (audio part): one-shot snapshot of the PipeWire graph, the resolved hardware
-//! source, mute state and Valve's mic filter nodes with their `filters` metadata state.
+//! `--probe` (audio part): one-shot snapshot of the default source and its mute state.
 
 use std::cell::Cell;
 use std::fmt;
@@ -8,20 +7,12 @@ use std::time::Duration;
 
 use pipewire as pw;
 
-use crate::graph::{filters_active, mic_filters, resolve_hardware_source, Graph, MicFilter};
+use crate::capture::is_connection_lost;
+use crate::graph::Graph;
 use crate::mute::{wpctl_muted, DEFAULT_SOURCE_TARGET};
 use crate::pwgraph::Watch;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// The device node bypass mode would record from.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HardwareSource {
-    pub node_id: u32,
-    pub name: String,
-    pub description: String,
-    pub channels: Vec<String>,
-}
 
 #[derive(Clone, Debug)]
 pub struct ProbeReport {
@@ -30,14 +21,7 @@ pub struct ProbeReport {
     /// `node.name` from `default.audio.source`.
     pub default_source: Option<String>,
     pub default_source_description: Option<String>,
-    pub hardware_source: Result<HardwareSource, String>,
     pub default_muted: Result<bool, String>,
-    /// Mute of the hardware node itself (only when it was resolved).
-    pub hardware_muted: Option<Result<bool, String>>,
-    /// Nodes with `steamos.mic_filter = true`.
-    pub mic_filters: Vec<MicFilter>,
-    /// Whether Valve's filters are enabled for other apps; `None` without mic filter nodes.
-    pub filters_active_for_others: Option<bool>,
 }
 
 /// Collects the report. Takes up to a few hundred milliseconds; never modifies the graph.
@@ -48,32 +32,15 @@ pub fn probe() -> ProbeReport {
         pipewire: graph.as_ref().map(|_| ()).map_err(Clone::clone),
         default_source: None,
         default_source_description: None,
-        hardware_source: Err("PipeWire unavailable".into()),
         default_muted,
-        hardware_muted: None,
-        mic_filters: Vec::new(),
-        filters_active_for_others: None,
     };
     let Ok(graph) = graph else { return report };
-    report.default_source = graph.default_source.clone();
     report.default_source_description = graph
         .default_source
         .as_deref()
         .and_then(|n| graph.node_by_name(n))
         .map(|n| n.label());
-    report.hardware_source = resolve_hardware_source(&graph)
-        .map(|hw| HardwareSource {
-            node_id: hw.node_id,
-            channels: hw.channels(),
-            name: hw.name,
-            description: hw.description,
-        })
-        .map_err(|e| e.to_string());
-    if let Ok(hw) = &report.hardware_source {
-        report.hardware_muted = Some(wpctl_muted(&hw.node_id.to_string()));
-    }
-    report.mic_filters = mic_filters(&graph);
-    report.filters_active_for_others = filters_active(&graph);
+    report.default_source = graph.default_source;
     report
 }
 
@@ -116,7 +83,7 @@ fn snapshot() -> Result<Graph, String> {
         .error({
             let (failure, mainloop) = (failure.clone(), mainloop.downgrade());
             move |id, _, res, message| {
-                if id == pw::core::PW_ID_CORE {
+                if is_connection_lost(id, res) {
                     log::warn!("PipeWire error: {message}");
                     failure.set(Some(res));
                     if let Some(l) = mainloop.upgrade() {
@@ -146,21 +113,6 @@ fn snapshot() -> Result<Graph, String> {
     Ok(graph)
 }
 
-fn yes_no(b: bool) -> &'static str {
-    if b {
-        "yes"
-    } else {
-        "no"
-    }
-}
-
-fn mute_text(m: &Result<bool, String>) -> String {
-    match m {
-        Ok(b) => yes_no(*b).to_owned(),
-        Err(e) => format!("unknown ({e})"),
-    }
-}
-
 impl fmt::Display for ProbeReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.pipewire {
@@ -172,45 +124,10 @@ impl fmt::Display for ProbeReport {
             (Some(name), None) => writeln!(f, "Default source: {name} (node not found)")?,
             (None, _) => writeln!(f, "Default source: none")?,
         }
-        writeln!(f, "Default source muted: {}", mute_text(&self.default_muted))?;
-        match &self.hardware_source {
-            Ok(hw) => {
-                writeln!(
-                    f,
-                    "Resolved hardware source: {} ({}), node {}, channels {}",
-                    hw.name,
-                    hw.description,
-                    hw.node_id,
-                    hw.channels.join(",")
-                )?;
-                if let Some(m) = &self.hardware_muted {
-                    writeln!(f, "Hardware source muted: {}", mute_text(m))?;
-                }
-            }
-            Err(e) => writeln!(f, "Resolved hardware source: unavailable ({e})")?,
+        match &self.default_muted {
+            Ok(true) => write!(f, "Default source muted: yes"),
+            Ok(false) => write!(f, "Default source muted: no"),
+            Err(e) => write!(f, "Default source muted: unknown ({e})"),
         }
-        if self.mic_filters.is_empty() {
-            writeln!(f, "Mic filter nodes: none (no steamos.mic_filter nodes)")?;
-        } else {
-            writeln!(f, "Mic filter nodes:")?;
-            for m in &self.mic_filters {
-                let origin = match &m.metadata_value {
-                    Some(v) => format!("filters metadata = {v}"),
-                    None => "not set in filters metadata".to_owned(),
-                };
-                writeln!(
-                    f,
-                    "  {} {}: filter.smart.disabled {} ({origin})",
-                    m.node_id,
-                    m.name,
-                    m.disabled
-                )?;
-            }
-        }
-        let active = match self.filters_active_for_others {
-            Some(b) => yes_no(b),
-            None => "n/a",
-        };
-        write!(f, "Valve mic filters active for other apps: {active}")
     }
 }

@@ -23,6 +23,8 @@ pub struct Strings {
     /// Template with `{lo}` and `{hi}`.
     pub live_target: &'static str,
     pub state_in_range: &'static str,
+    pub state_too_low: &'static str,
+    pub state_too_high: &'static str,
     pub state_out_of_range: &'static str,
     pub state_no_voice: &'static str,
     pub state_muted: &'static str,
@@ -30,10 +32,6 @@ pub struct Strings {
 
     pub section_hud: &'static str,
     pub hud_enabled: &'static str,
-    pub placement: &'static str,
-    pub placement_head: &'static str,
-    pub placement_left_wrist: &'static str,
-    pub placement_right_wrist: &'static str,
     pub display: &'static str,
     pub display_color: &'static str,
     pub display_detailed: &'static str,
@@ -56,6 +54,9 @@ pub struct Strings {
     pub preset_custom: &'static str,
     pub custom_low: &'static str,
     pub custom_high: &'static str,
+    /// Near-zone row label and value template (`{hz}`).
+    pub near_zone: &'static str,
+    pub near_zone_value: &'static str,
 
     pub section_reminder: &'static str,
     pub reminder_enabled: &'static str,
@@ -72,8 +73,6 @@ pub struct Strings {
 
     pub section_system: &'static str,
     pub autostart: &'static str,
-    pub mic_bypass: &'static str,
-    pub mic_processed: &'static str,
 
     pub tab_general: &'static str,
     pub tab_resonance: &'static str,
@@ -111,9 +110,7 @@ pub struct Strings {
     // Resonance indicator on the HUD (§4.1, §5.1); shown in a narrow column, keep short.
     pub hud_res_relaxed: &'static str,
     pub hud_res_target: &'static str,
-    pub hud_res_uncalibrated: &'static str,
     pub hud_res_too_similar: &'static str,
-    pub hud_res_needs_bypass: &'static str,
 
     // Resonance page of the settings panel (§4.2, §5.1).
     pub section_resonance: &'static str,
@@ -123,25 +120,19 @@ pub struct Strings {
     pub res_now: &'static str,
     pub res_off_hint: &'static str,
     pub res_gathering: &'static str,
-    pub res_uncalibrated: &'static str,
     pub res_too_similar: &'static str,
-    pub res_needs_bypass: &'static str,
     pub res_near_relaxed: &'static str,
     pub res_between: &'static str,
     pub res_near_target: &'static str,
     pub res_beyond_target: &'static str,
 
-    pub section_calibration: &'static str,
-    pub record_relaxed: &'static str,
-    pub record_target: &'static str,
-    pub calib_not_recorded: &'static str,
-    /// Template; `{s}` is replaced by the whole seconds left.
-    pub calib_recording: &'static str,
-    /// Template; `{v}` is replaced by the stored formant spacing in Hz.
-    pub calib_done: &'static str,
-    /// Failure message for a calibration with fewer than 3 s of accepted frames (§5.1).
-    pub calib_not_enough_speech: &'static str,
-    pub calib_hint: &'static str,
+    pub section_reference: &'static str,
+    pub res_reading: &'static str,
+    pub res_relaxed: &'static str,
+    pub res_target: &'static str,
+    /// Template; `{v}` is replaced by a formant spacing in Hz.
+    pub res_hz: &'static str,
+    pub res_reference_hint: &'static str,
 
     // Explanation card (§5.1 "User guidance"). Paragraphs in display order: `card_what`,
     // `card_others`, `card_pitch`, `card_turn_off` (emphasised), then `card_cases` as bullets.
@@ -175,6 +166,8 @@ pub const EN: Strings = Strings {
     live_heading: "Live",
     live_target: "Target {lo}\u{2013}{hi} Hz",
     state_in_range: "In range",
+    state_too_low: "Too low \u{2014} raise your voice",
+    state_too_high: "Too high \u{2014} lower your voice",
     state_out_of_range: "Out of range",
     state_no_voice: "No voice",
     state_muted: "Mic muted",
@@ -182,10 +175,6 @@ pub const EN: Strings = Strings {
 
     section_hud: "HUD",
     hud_enabled: "Show HUD",
-    placement: "Placement",
-    placement_head: "Head",
-    placement_left_wrist: "Left wrist",
-    placement_right_wrist: "Right wrist",
     display: "Display",
     display_color: "Colour",
     display_detailed: "Detailed",
@@ -207,9 +196,11 @@ pub const EN: Strings = Strings {
     preset_custom: "Custom",
     custom_low: "Custom low",
     custom_high: "Custom high",
+    near_zone: "Yellow/orange zone",
+    near_zone_value: "\u{00b1}{hz} Hz",
 
-    section_reminder: "Reminder tone",
-    reminder_enabled: "Tone",
+    section_reminder: "Out of range",
+    reminder_enabled: "Reminder tone",
     reminder_delay: "Delay",
     reminder_pitch: "Pitch",
     reminder_volume: "Volume",
@@ -221,8 +212,6 @@ pub const EN: Strings = Strings {
 
     section_system: "Microphone & startup",
     autostart: "Autostart with SteamVR",
-    mic_bypass: "Bypass Valve processing (this app only)",
-    mic_processed: "Use processed mic",
 
     tab_general: "General",
     tab_resonance: "Resonance (experimental)",
@@ -259,52 +248,47 @@ pub const EN: Strings = Strings {
 
     hud_res_relaxed: "relaxed",
     hud_res_target: "target",
-    hud_res_uncalibrated: "Calibrate in settings",
-    hud_res_too_similar: "Recordings too similar",
-    hud_res_needs_bypass: "Needs bypass mic mode",
+    hud_res_too_similar: "Values too similar",
 
     section_resonance: "Resonance (experimental)",
     res_enabled: "Indicator",
-    res_intro: "Shows whether your voice is drifting brighter or darker compared with your own two \
-                recordings. It is rough and moves slowly. It appears on the HUD next to the pitch \
-                bar when Display is set to Detailed.",
+    res_intro: "Shows whether your voice is drifting brighter or darker compared with two \
+                reference values you set. It is rough and moves slowly. It appears on the HUD \
+                next to the pitch bar when Display is set to Detailed.",
     res_how: "How this works",
     res_now: "Right now",
-    res_off_hint: "Off. Turn the indicator on to record your voice and see where it is.",
+    res_off_hint: "Off. Turn the indicator on to see where your voice is.",
     res_gathering: "Listening\u{2026} keep talking for a few seconds",
-    res_uncalibrated: "Record your relaxed and your target voice to see the indicator",
-    res_too_similar: "These two recordings are too similar to tell apart; the indicator will not \
-                      be useful",
-    res_needs_bypass: "Resonance needs the bypass mic mode",
+    res_too_similar: "The relaxed and target values are too close to tell apart (less than 5 % \
+                      apart); move them further apart",
     res_near_relaxed: "Brightness: near relaxed",
     res_between: "Brightness: between",
     res_near_target: "Brightness: near target",
     res_beyond_target: "Brightness: beyond target",
 
-    section_calibration: "Calibration",
-    record_relaxed: "Record relaxed voice (10 s)",
-    record_target: "Record target voice (10 s)",
-    calib_not_recorded: "Not recorded yet",
-    calib_recording: "Recording\u{2026} keep talking ({s} s left)",
-    calib_done: "Recorded \u{00b7} {v} Hz",
-    calib_not_enough_speech: "Not enough clear speech \u{2014} try again in a quiet place, speaking \
-                              normally",
-    calib_hint: "Speak normally for the whole 10 seconds, in a quiet place, in the language and \
-                 accent you use in VR. Record again whenever you change language or accent.",
+    section_reference: "Reference values",
+    res_reading: "Current reading",
+    res_relaxed: "Relaxed",
+    res_target: "Target",
+    res_hz: "{v} Hz",
+    res_reference_hint: "Speak a few sentences in your relaxed voice and set Relaxed to the \
+                         current reading; then do the same in your target voice. Higher means \
+                         brighter. Readings depend on language and accent, so set them in the \
+                         one you use in VR.",
 
     card_title: "About the resonance indicator (experimental)",
     card_what: "This is a rough estimate of how bright or dark your voice sounds, compared with \
-                two recordings of your own voice: one relaxed, one in your target voice. It moves \
-                slowly on purpose.",
+                two reference values you set from your own voice: one relaxed, one in your target \
+                voice. It moves slowly on purpose.",
     card_others: "It cannot tell you how other people hear your voice. A voice coach or someone \
                   you trust can.",
     card_pitch: "Pitch feedback works the same with this on or off.",
     card_turn_off: "Turn it off if any of these apply, or if it does not match what you hear or \
                     what people you trust tell you:",
     card_cases: [
-        "You speak a different language or accent in VR than in your recordings, or you switch \
-         often. Vowels differ between languages and accents, and they move the estimate. Record \
-         again in the language you are using.",
+        "You speak a different language or accent in VR than when you set the reference values, \
+         or you switch often. Vowels differ between languages and accents, and they move the \
+         estimate. Set the values again in the language you are using.",
         "You are whispering, singing or shouting, your voice is very high (above about 300 Hz it \
          cannot measure), or the room is noisy.",
         "Your goal is not about how bright or dark your voice sounds.",

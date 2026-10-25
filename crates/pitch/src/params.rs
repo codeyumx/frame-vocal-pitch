@@ -92,13 +92,8 @@ pub const RESONANCE_MIN_ACCEPTED_S: f64 = 2.0;
 pub const RESONANCE_MEDIAN_INTERVAL_S: f64 = 0.1;
 /// Resonance: time constant of the displayed-value EMA.
 pub const RESONANCE_SMOOTHING_S: f64 = 1.0;
-/// Resonance calibration: recording length.
-pub const CALIBRATION_S: f64 = 10.0;
-/// Resonance calibration: accepted frames needed for a result.
-pub const CALIBRATION_MIN_ACCEPTED_S: f64 = 3.0;
-/// Resonance calibration: relaxed and target closer than this fraction of
-/// relaxed are "too similar".
-pub const CALIBRATION_MIN_SEPARATION: f32 = 0.05;
+/// Resonance reference values closer than this fraction of relaxed are "too similar".
+pub const RESONANCE_MIN_SEPARATION: f32 = 0.05;
 
 /// Slack for comparisons of hop timestamps against durations.
 pub(crate) const TIME_EPS: f64 = 1e-6;

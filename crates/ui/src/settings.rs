@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use fvp_config::{Config, DisplayMode, MicMode, Placement, Preset, CUSTOM_MIN_GAP_HZ};
+use fvp_config::{Config, DisplayMode, Preset, CUSTOM_MIN_GAP_HZ};
 use tiny_skia::{Color, Pixmap};
 
 use crate::draw::{self, Rgba, R};
@@ -36,32 +36,15 @@ pub mod steps {
     pub const PITCH_RANGE: (f32, f32) = (100.0, 1000.0);
     pub const VOLUME: f32 = 0.1;
     pub const VOLUME_RANGE: (f32, f32) = (0.0, 1.0);
+    /// Yellow/orange zone width (Hz); 0 = off.
+    pub const NEAR_RANGE: (f32, f32) = (0.0, 50.0);
     pub const VOCAL_REST_MIN: u32 = 5;
     pub const VOCAL_REST_RANGE: (u32, u32) = (5, 50);
     /// Small and large custom-band steps (Hz).
     pub const BAND_SMALL_HZ: f32 = 1.0;
     pub const BAND_LARGE_HZ: f32 = 10.0;
-}
-
-/// Which calibration recording (§5.1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum CalibWhich {
-    Relaxed,
-    Target,
-}
-
-/// State of one calibration recording (§5.1).
-#[derive(Clone, PartialEq, Debug, Default)]
-pub enum CalibStatus {
-    /// Not recorded in this session; the panel shows the value stored in the config, if any.
-    #[default]
-    NotRecorded,
-    /// Recording in progress; `progress` runs from 0 to 1 over the 10 s.
-    Recording { progress: f32 },
-    /// Finished: median formant spacing ΔF of the accepted frames.
-    Done { df_hz: f32 },
-    /// Failed; the message is shown as is (e.g. [`crate::Strings::calib_not_enough_speech`]).
-    Failed(String),
+    /// Resonance reference value range (Hz), stepped by ±10/±50.
+    pub const RES_DF_RANGE: (f32, f32) = (500.0, 2000.0);
 }
 
 /// Live resonance data for the settings panel.
@@ -69,8 +52,9 @@ pub enum CalibStatus {
 pub struct ResonanceLive {
     /// Current indicator state; `None` while resonance feedback is off.
     pub position: Option<ResonanceView>,
-    pub relaxed: CalibStatus,
-    pub target: CalibStatus,
+    /// Smoothed reading R in Hz, shown so the user can pick reference values; `None` while
+    /// off or gathering.
+    pub reading_hz: Option<f32>,
 }
 
 /// What the Updates section shows (§4.2, §7.1); the text is [`update_status_text`].
@@ -134,8 +118,6 @@ pub enum Action {
     SetAutostart(bool),
     /// Quit (exit status 3).
     Quit,
-    /// Start a 10 s calibration recording (§5.1).
-    StartCalibration(CalibWhich),
     /// "Check now": ask GitHub for the latest release, ignoring the cache (§7.1).
     CheckUpdates,
     /// "Update to X.Y.Z" confirmed by "Confirm update": install this version (`X.Y.Z`).
@@ -190,7 +172,6 @@ enum Axis {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Control {
     HudEnabled(bool),
-    Placement(Placement),
     Display(DisplayMode),
     Size(i8),
     Opacity(i8),
@@ -198,12 +179,13 @@ enum Control {
     Preset(Preset),
     CustomLow(i8),
     CustomHigh(i8),
+    /// Near-zone width step in Hz.
+    NearZone(i8),
     ReminderEnabled(bool),
     ReminderDelay(i8),
     ReminderPitch(i8),
     ReminderVolume(i8),
     VocalRest(i8),
-    MicMode(MicMode),
     Autostart(bool),
     Quit,
     /// "Check now".
@@ -217,7 +199,9 @@ enum Control {
     ResonanceEnabled(bool),
     /// Re-opens the explanation card (panel-internal).
     HowItWorks,
-    Record(CalibWhich),
+    /// Relaxed / target reference value steps in Hz.
+    RelaxedDf(i8),
+    TargetDf(i8),
     /// Explanation card: "Turn on".
     CardTurnOn,
     /// Explanation card: "Keep off" / "Close" (panel-internal).
@@ -290,14 +274,18 @@ fn apply(control: Control, cfg: &Config, autostart: bool) -> Option<Action> {
     match control {
         Control::Quit => return Some(Action::Quit),
         Control::Autostart(on) => return (on != autostart).then_some(Action::SetAutostart(on)),
-        Control::Record(which) => return Some(Action::StartCalibration(which)),
         Control::CheckUpdates => return Some(Action::CheckUpdates),
         Control::Tab(_) | Control::HowItWorks | Control::CardClose | Control::Update => return None,
         Control::UpdateAuto(on) => c.update.check = on,
+        Control::RelaxedDf(d) => {
+            c.resonance.relaxed_df_hz = step(c.resonance.relaxed_df_hz, f32::from(d), steps::RES_DF_RANGE)
+        }
+        Control::TargetDf(d) => {
+            c.resonance.target_df_hz = step(c.resonance.target_df_hz, f32::from(d), steps::RES_DF_RANGE)
+        }
         Control::ResonanceEnabled(on) => c.resonance.enabled = on,
         Control::CardTurnOn => c.resonance.enabled = true,
         Control::HudEnabled(on) => c.hud.enabled = on,
-        Control::Placement(p) => c.hud.placement = p,
         Control::Display(d) => c.hud.display = d,
         Control::Size(d) => {
             c.hud.size_m = step(c.hud.size_m, d as f32 * steps::SIZE_M, steps::SIZE_RANGE)
@@ -326,6 +314,7 @@ fn apply(control: Control, cfg: &Config, autostart: bool) -> Option<Action> {
             let hi_min = (t.custom_low_hz + CUSTOM_MIN_GAP_HZ).min(hi_max);
             t.custom_high_hz = (t.custom_high_hz + band_step(d)).clamp(hi_min, hi_max);
         }
+        Control::NearZone(d) => c.target.near_hz = step(c.target.near_hz, f32::from(d), steps::NEAR_RANGE),
         Control::ReminderEnabled(on) => c.reminder.enabled = on,
         Control::ReminderDelay(d) => {
             c.reminder.delay_s =
@@ -340,7 +329,6 @@ fn apply(control: Control, cfg: &Config, autostart: bool) -> Option<Action> {
                 step(c.reminder.volume, d as f32 * steps::VOLUME, steps::VOLUME_RANGE)
         }
         Control::VocalRest(d) => c.vocal_rest.minutes = step_vocal_rest(c.vocal_rest.minutes, d),
-        Control::MicMode(m) => c.audio.mic_mode = m,
     }
     (c != *cfg).then_some(Action::SetConfig(c))
 }
@@ -363,7 +351,6 @@ const CTRL_H: f32 = 38.0;
 const HEAD_H: f32 = 44.0;
 const CARD_GAP: f32 = 12.0;
 const CARD_BOTTOM_PAD: f32 = 10.0;
-const RADIO_H: f32 = 42.0;
 const STATUS_LINE_H: f32 = 22.0;
 const STATUS_LINES: usize = 3;
 /// Scroll distance per unit of `scroll(dy)`.
@@ -377,11 +364,7 @@ const RES_INTRO_LINE_H: f32 = 24.0;
 const RES_NOW_H: f32 = 30.0;
 const RES_POS_LINES: usize = 3;
 const RES_POS_LINE_H: f32 = 30.0;
-const CALIB_BTN_H: f32 = 46.0;
-const CALIB_STATUS_H: f32 = 60.0;
-const CALIB_HINT_LINES: usize = 4;
-/// Length of a calibration recording (§5.1), for the "s left" readout.
-const CALIBRATION_S: f32 = 10.0;
+const RES_HINT_LINES: usize = 5;
 
 // Updates page.
 const UPD_STATUS_LINES: usize = 2;
@@ -433,19 +416,19 @@ const fn content_height(page: Page) -> f32 {
     }
 }
 const fn hud_card_h() -> f32 {
-    HEAD_H + 7.0 * ROW_H + 28.0 + CARD_BOTTOM_PAD
+    HEAD_H + 6.0 * ROW_H + 28.0 + CARD_BOTTOM_PAD
 }
 const fn target_card_h() -> f32 {
     HEAD_H + 3.0 * ROW_H + CARD_BOTTOM_PAD
 }
 const fn reminder_card_h() -> f32 {
-    HEAD_H + 4.0 * ROW_H + CARD_BOTTOM_PAD
+    HEAD_H + 5.0 * ROW_H + CARD_BOTTOM_PAD
 }
 const fn rest_card_h() -> f32 {
     HEAD_H + ROW_H + CARD_BOTTOM_PAD
 }
 const fn system_card_h() -> f32 {
-    HEAD_H + 2.0 * RADIO_H + STATUS_LINES as f32 * STATUS_LINE_H + 8.0 + ROW_H + CARD_BOTTOM_PAD
+    HEAD_H + STATUS_LINES as f32 * STATUS_LINE_H + 8.0 + ROW_H + CARD_BOTTOM_PAD
 }
 /// Both cards of the resonance page share this height.
 const fn resonance_card_h() -> f32 {
@@ -456,8 +439,7 @@ const fn resonance_card_h() -> f32 {
         + ROW_H
         + RES_NOW_H
         + RES_POS_LINES as f32 * RES_POS_LINE_H;
-    let right = HEAD_H + 2.0 * (CALIB_BTN_H + 6.0 + CALIB_STATUS_H + 10.0)
-        + CALIB_HINT_LINES as f32 * RES_INTRO_LINE_H;
+    let right = HEAD_H + 3.0 * ROW_H + 8.0 + RES_HINT_LINES as f32 * RES_INTRO_LINE_H;
     (if left > right { left } else { right }) + CARD_BOTTOM_PAD
 }
 /// Both cards of the updates page share this height.
@@ -493,6 +475,8 @@ fn fmt_hz(v: f32) -> String {
 fn state_label(state: HudState) -> &'static str {
     match state {
         HudState::InRange => STRINGS.state_in_range,
+        HudState::TooLow => STRINGS.state_too_low,
+        HudState::TooHigh => STRINGS.state_too_high,
         HudState::OutOfRange => STRINGS.state_out_of_range,
         HudState::NoVoice => STRINGS.state_no_voice,
         HudState::Muted => STRINGS.state_muted,
@@ -506,9 +490,7 @@ fn position_text(view: Option<ResonanceView>) -> &'static str {
     match view {
         None => STRINGS.no_f0,
         Some(ResonanceView::Gathering) => STRINGS.res_gathering,
-        Some(ResonanceView::Uncalibrated) => STRINGS.res_uncalibrated,
         Some(ResonanceView::TooSimilar) => STRINGS.res_too_similar,
-        Some(ResonanceView::NeedsBypass) => STRINGS.res_needs_bypass,
         Some(ResonanceView::Position(p)) if !p.is_finite() => STRINGS.res_gathering,
         Some(ResonanceView::Position(p)) if p < 0.25 => STRINGS.res_near_relaxed,
         Some(ResonanceView::Position(p)) if p < 0.75 => STRINGS.res_between,
@@ -726,29 +708,6 @@ impl Ui<'_> {
         }
     }
 
-    fn radio(&mut self, r: R, label: &str, control: Control, selected: bool) {
-        let hover = self.widget(r, control, true);
-        if hover {
-            self.fill(r, 8.0, CTRL_HOVER);
-        }
-        let p = self.place(r);
-        let (cx, cy) = (p.x + 20.0, p.cy());
-        draw::fill_circle(self.pm, cx, cy, 11.0, if selected { ACCENT } else { TEXT_DIM });
-        draw::fill_circle(self.pm, cx, cy, 8.5, CARD);
-        if selected {
-            draw::fill_circle(self.pm, cx, cy, 5.5, ACCENT);
-        }
-        let weight = if selected { Weight::SemiBold } else { Weight::Regular };
-        self.text(
-            R::new(r.x + 42.0, r.y, r.w - 50.0, r.h),
-            label,
-            20.0,
-            weight,
-            TEXT,
-            Align::Left,
-        );
-    }
-
     /// Wrapped multi-line text in `r`, shrinking from `max_px` until it fits `max_lines`.
     #[allow(clippy::too_many_arguments)]
     fn paragraph(&mut self, r: R, text: &str, max_lines: usize, line_h: f32, max_px: f32, weight: Weight, color: Rgba) {
@@ -835,7 +794,7 @@ fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, page: Page) {
     let strip = R::new(M, 78.0, W - 2.0 * M, 66.0);
     ui.fill(strip, 14.0, CARD);
     ui.text(R::new(strip.x + 20.0, strip.y, 90.0, strip.h), STRINGS.live_heading, 20.0, Weight::Regular, TEXT_DIM, Align::Left);
-    let voiced = matches!(live.state, HudState::InRange | HudState::OutOfRange);
+    let voiced = live.state.voiced();
     let f0 = live.f0_hz.filter(|f| voiced && f.is_finite() && *f > 0.0);
     let f0_text = f0.map_or_else(|| STRINGS.no_f0.to_string(), fmt_hz);
     ui.text(R::new(strip.x + 116.0, strip.y, 170.0, strip.h), &f0_text, 34.0, Weight::SemiBold, TEXT, Align::Left);
@@ -867,19 +826,6 @@ fn body_left(ui: &mut Ui<'_>, cfg: &Config) {
 
     ui.row_label(x, y, STRINGS.hud_enabled, true);
     ui.on_off(ctrl_rect(x, y), h.enabled, Control::HudEnabled);
-    y += ROW_H;
-
-    ui.row_label(x, y, STRINGS.placement, true);
-    let p = h.placement;
-    ui.segmented(
-        ctrl_rect(x, y),
-        &[
-            (STRINGS.placement_head, Control::Placement(Placement::Head), p == Placement::Head),
-            (STRINGS.placement_left_wrist, Control::Placement(Placement::LeftWrist), p == Placement::LeftWrist),
-            (STRINGS.placement_right_wrist, Control::Placement(Placement::RightWrist), p == Placement::RightWrist),
-        ],
-        true,
-    );
     y += ROW_H;
 
     ui.row_label(x, y, STRINGS.display, true);
@@ -971,6 +917,21 @@ fn body_right(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     let x = RIGHT_X;
     let r = &cfg.reminder;
     let mut y = ui.card(x, VIEW_TOP, reminder_card_h(), STRINGS.section_reminder);
+    let near = cfg.target.near_hz;
+    let value = if near <= 0.0 {
+        STRINGS.off.to_string()
+    } else {
+        STRINGS.near_zone_value.replace("{hz}", &fmt_num(near, 0))
+    };
+    ui.row_label(x, y, STRINGS.near_zone, true);
+    ui.stepper(
+        ctrl_rect(x, y),
+        &value,
+        &[("\u{2212}5", Control::NearZone(-5)), ("\u{2212}1", Control::NearZone(-1))],
+        &[("+1", Control::NearZone(1)), ("+5", Control::NearZone(5))],
+        true,
+    );
+    y += ROW_H;
     ui.row_label(x, y, STRINGS.reminder_enabled, true);
     ui.on_off(ctrl_rect(x, y), r.enabled, Control::ReminderEnabled);
     y += ROW_H;
@@ -1003,13 +964,7 @@ fn body_right(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     );
 
     let sys_y = rest_y + rest_card_h() + CARD_GAP;
-    let mut y = ui.card(x, sys_y, system_card_h(), STRINGS.section_system);
-    let mode = cfg.audio.mic_mode;
-    let full = R::new(x + PAD - 6.0, y, COL_W - 2.0 * PAD + 12.0, RADIO_H);
-    ui.radio(full, STRINGS.mic_bypass, Control::MicMode(MicMode::Bypass), mode == MicMode::Bypass);
-    y += RADIO_H;
-    ui.radio(R::new(full.x, y, full.w, RADIO_H), STRINGS.mic_processed, Control::MicMode(MicMode::Processed), mode == MicMode::Processed);
-    y += RADIO_H + 4.0;
+    let mut y = ui.card(x, sys_y, system_card_h(), STRINGS.section_system) + 4.0;
     ui.paragraph(
         R::new(x + PAD, y, COL_W - 2.0 * PAD, STATUS_LINES as f32 * STATUS_LINE_H),
         &live.mic_status_line,
@@ -1025,7 +980,7 @@ fn body_right(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
 }
 
 /// Resonance page (§4.2, §5.1): switch, explanation and current position on the left,
-/// calibration on the right.
+/// reference values and the live reading on the right.
 fn resonance_page(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     let on = cfg.resonance.enabled;
     let res = &live.resonance;
@@ -1069,24 +1024,33 @@ fn resonance_page(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     );
 
     let x = RIGHT_X;
-    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_calibration);
-    let busy = [&res.relaxed, &res.target].iter().any(|s| matches!(s, CalibStatus::Recording { .. }));
-    let can_record = on && !busy && res.position != Some(ResonanceView::NeedsBypass);
-    let calibrations = [
-        (CalibWhich::Relaxed, STRINGS.record_relaxed, &res.relaxed, cfg.resonance.relaxed_df_hz),
-        (CalibWhich::Target, STRINGS.record_target, &res.target, cfg.resonance.target_df_hz),
+    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_reference);
+    let reading = match res.reading_hz.filter(|_| on) {
+        Some(hz) => STRINGS.res_hz.replace("{v}", &fmt_num(hz, 0)),
+        None => "\u{2014}".to_string(),
+    };
+    ui.row_label(x, y, STRINGS.res_reading, on);
+    ui.text(ctrl_rect(x, y), &reading, 22.0, Weight::SemiBold, TEXT, Align::Center);
+    y += ROW_H;
+    let rows: [(&str, f32, fn(i8) -> Control); 2] = [
+        (STRINGS.res_relaxed, cfg.resonance.relaxed_df_hz, Control::RelaxedDf),
+        (STRINGS.res_target, cfg.resonance.target_df_hz, Control::TargetDf),
     ];
-    for (which, label, status, stored) in calibrations {
-        let recording = matches!(status, CalibStatus::Recording { .. });
-        ui.button(R::new(x + PAD, y, inner, CALIB_BTN_H), label, Control::Record(which), can_record, recording);
-        y += CALIB_BTN_H + 6.0;
-        calib_status(ui, R::new(x + PAD, y, inner, CALIB_STATUS_H), status, stored, on);
-        y += CALIB_STATUS_H + 10.0;
+    for (label, value, make) in rows {
+        ui.row_label(x, y, label, on);
+        ui.stepper(
+            ctrl_rect(x, y),
+            &STRINGS.res_hz.replace("{v}", &fmt_num(value, 0)),
+            &[("\u{2212}50", make(-50)), ("\u{2212}10", make(-10))],
+            &[("+10", make(10)), ("+50", make(50))],
+            on,
+        );
+        y += ROW_H;
     }
     ui.paragraph(
-        R::new(x + PAD, y, inner, CALIB_HINT_LINES as f32 * RES_INTRO_LINE_H),
-        STRINGS.calib_hint,
-        CALIB_HINT_LINES,
+        R::new(x + PAD, y + 8.0, inner, RES_HINT_LINES as f32 * RES_INTRO_LINE_H),
+        STRINGS.res_reference_hint,
+        RES_HINT_LINES,
         RES_INTRO_LINE_H,
         18.0,
         Weight::Regular,
@@ -1152,35 +1116,6 @@ fn updates_page(ui: &mut Ui<'_>, cfg: &Config, upd: &UpdateLive, armed: bool) {
     }
 }
 
-/// Progress bar while recording, else the result, failure message or "not recorded".
-fn calib_status(ui: &mut Ui<'_>, r: R, status: &CalibStatus, stored: Option<f32>, on: bool) {
-    let fade = |c: Rgba| if on { c } else { c.with_alpha(DISABLED_ALPHA + 40) };
-    let done = |df: f32| fill_v(STRINGS.calib_done, &fmt_num(df, 0));
-    match status {
-        CalibStatus::Recording { progress } => {
-            let p = progress.clamp(0.0, 1.0);
-            let bar = R::new(r.x, r.y + 6.0, r.w, 12.0);
-            ui.fill(bar, 6.0, CTRL);
-            if p > 0.0 {
-                ui.fill(R::new(bar.x, bar.y, (bar.w * p).max(bar.h), bar.h), 6.0, ACCENT);
-            }
-            let left = ((1.0 - p) * CALIBRATION_S).ceil() as u32;
-            let text = STRINGS.calib_recording.replace("{s}", &left.to_string());
-            ui.text(R::new(r.x, r.y + 24.0, r.w, 30.0), &text, 19.0, Weight::Regular, fade(TEXT), Align::Left);
-        }
-        CalibStatus::Failed(msg) => {
-            ui.paragraph(r, msg, 2, r.h / 2.0, 19.0, Weight::Regular, fade(WARN));
-        }
-        CalibStatus::Done { df_hz } => {
-            ui.text(R::new(r.x, r.y, r.w, 32.0), &done(*df_hz), 19.0, Weight::Regular, fade(TEXT), Align::Left);
-        }
-        CalibStatus::NotRecorded => match stored {
-            Some(df) => ui.text(R::new(r.x, r.y, r.w, 32.0), &done(df), 19.0, Weight::Regular, fade(TEXT), Align::Left),
-            None => ui.text(R::new(r.x, r.y, r.w, 32.0), STRINGS.calib_not_recorded, 19.0, Weight::Regular, fade(TEXT_DIM), Align::Left),
-        },
-    }
-}
-
 /// The modal explanation card (§5.1 "User guidance") with its scrollable text.
 fn explanation_card(ui: &mut Ui<'_>, card: Card, scroll: f32) {
     draw::fill_rounded(ui.pm, R::new(0.0, 0.0, W, H), 0.0, SCRIM);
@@ -1233,34 +1168,6 @@ fn explanation_card(ui: &mut Ui<'_>, card: Card, scroll: f32) {
     }
 }
 
-/// Quantised calibration status (failure messages are compared separately).
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum CalibKey {
-    NotRecorded,
-    /// Percent.
-    Recording(i32),
-    Done(i32),
-    Failed,
-}
-
-impl CalibKey {
-    fn of(s: &CalibStatus) -> Self {
-        match s {
-            CalibStatus::NotRecorded => CalibKey::NotRecorded,
-            CalibStatus::Recording { progress } => CalibKey::Recording((progress.clamp(0.0, 1.0) * 100.0).round() as i32),
-            CalibStatus::Done { df_hz } => CalibKey::Done(df_hz.round() as i32),
-            CalibStatus::Failed(_) => CalibKey::Failed,
-        }
-    }
-}
-
-fn failure_message(s: &CalibStatus) -> &str {
-    match s {
-        CalibStatus::Failed(msg) => msg,
-        _ => "",
-    }
-}
-
 /// Quantised live values that influence the pixels.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct LiveKey {
@@ -1268,7 +1175,7 @@ struct LiveKey {
     state: HudState,
     autostart: bool,
     res_text: &'static str,
-    calib: [CalibKey; 2],
+    reading: Option<i32>,
 }
 
 impl LiveKey {
@@ -1279,7 +1186,7 @@ impl LiveKey {
             state: live.state,
             autostart: live.autostart,
             res_text: position_text(res.position),
-            calib: [CalibKey::of(&res.relaxed), CalibKey::of(&res.target)],
+            reading: res.reading_hz.filter(|f| f.is_finite()).map(|f| f.round() as i32),
         }
     }
 }
@@ -1319,8 +1226,6 @@ pub struct SettingsPanel {
     /// What the pixels currently show; `None` forces a render.
     last: Option<RenderKey>,
     last_status: String,
-    /// Failure messages (relaxed, target) the pixels currently show.
-    last_failures: [String; 2],
     /// Update state the pixels currently show; its `available` version is what "Update to"
     /// installs.
     last_update: UpdateLive,
@@ -1348,7 +1253,6 @@ impl SettingsPanel {
             autostart: false,
             last: None,
             last_status: String::new(),
-            last_failures: [String::new(), String::new()],
             last_update: UpdateLive::default(),
             confirm: Confirm::default(),
             dirty: true,
@@ -1370,13 +1274,10 @@ impl SettingsPanel {
         }
         let armed = live.update.available.as_deref().is_some_and(|v| self.confirm.armed(v, now));
         let key = RenderKey { live: LiveKey::of(live), hover: self.hover, view: self.view, armed };
-        let failures = [failure_message(&live.resonance.relaxed), failure_message(&live.resonance.target)];
         let unchanged = !self.dirty
             && self.cfg.as_ref() == Some(cfg)
             && self.last.as_ref() == Some(&key)
             && self.last_status == live.mic_status_line
-            && self.last_failures[0] == failures[0]
-            && self.last_failures[1] == failures[1]
             && self.last_update == live.update;
         if unchanged {
             return None;
@@ -1385,12 +1286,6 @@ impl SettingsPanel {
         if self.last_status != live.mic_status_line {
             self.last_status.clear();
             self.last_status.push_str(&live.mic_status_line);
-        }
-        for (last, now) in self.last_failures.iter_mut().zip(failures) {
-            if last != now {
-                last.clear();
-                last.push_str(now);
-            }
         }
         if self.cfg.as_ref() != Some(cfg) {
             self.cfg = Some(cfg.clone());
@@ -1486,7 +1381,7 @@ impl SettingsPanel {
                 self.autostart = *on;
                 self.dirty = true;
             }
-            Action::Quit | Action::StartCalibration(_) | Action::CheckUpdates | Action::StartUpdate(_) => {}
+            Action::Quit | Action::CheckUpdates | Action::StartUpdate(_) => {}
         }
         Some(action)
     }
@@ -1550,7 +1445,7 @@ mod tests {
         LiveInfo {
             f0_hz: Some(182.0),
             state: HudState::InRange,
-            mic_status_line: "Bypass \u{00b7} recording from Internal Microphone".into(),
+            mic_status_line: "Recording from Built-in Audio Capture".into(),
             autostart: false,
             resonance: ResonanceLive::default(),
             update: UpdateLive::default(),
@@ -1592,8 +1487,6 @@ mod tests {
     fn every_control_hits_and_produces_its_action() {
         let base = Config::default();
         expect_cfg(&base, Control::HudEnabled(false), |c| c.hud.enabled = false);
-        expect_cfg(&base, Control::Placement(Placement::LeftWrist), |c| c.hud.placement = Placement::LeftWrist);
-        expect_cfg(&base, Control::Placement(Placement::RightWrist), |c| c.hud.placement = Placement::RightWrist);
         expect_cfg(&base, Control::Display(DisplayMode::Detailed), |c| c.hud.display = DisplayMode::Detailed);
         expect_cfg(&base, Control::Size(1), |c| c.hud.size_m = 0.06);
         expect_cfg(&base, Control::Size(-1), |c| c.hud.size_m = 0.04);
@@ -1615,7 +1508,6 @@ mod tests {
         expect_cfg(&base, Control::ReminderVolume(1), |c| c.reminder.volume = 0.6);
         expect_cfg(&base, Control::ReminderVolume(-1), |c| c.reminder.volume = 0.4);
         expect_cfg(&base, Control::VocalRest(1), |c| c.vocal_rest.minutes = 5);
-        expect_cfg(&base, Control::MicMode(MicMode::Processed), |c| c.audio.mic_mode = MicMode::Processed);
 
         let mut custom = base.clone();
         custom.target.preset = Preset::Custom;
@@ -1629,20 +1521,25 @@ mod tests {
         expect_cfg(&custom, Control::CustomHigh(-1), |c| c.target.custom_high_hz = 249.0);
         expect_cfg(&custom, Control::CustomHigh(1), |c| c.target.custom_high_hz = 251.0);
         expect_cfg(&custom, Control::CustomHigh(10), |c| c.target.custom_high_hz = 260.0);
+        // Near zone: default 10 Hz, 0 = off, at most 50.
+        expect_cfg(&base, Control::NearZone(5), |c| c.target.near_hz = 15.0);
+        expect_cfg(&base, Control::NearZone(-1), |c| c.target.near_hz = 9.0);
+        let mut near_off = base.clone();
+        near_off.target.near_hz = 2.0;
+        expect_cfg(&near_off, Control::NearZone(-5), |c| c.target.near_hz = 0.0);
+        let mut near_max = base.clone();
+        near_max.target.near_hz = 50.0;
+        assert_eq!(apply(Control::NearZone(5), &near_max, false), None);
         let mut rest = base.clone();
         rest.vocal_rest.minutes = 30;
         expect_cfg(&rest, Control::VocalRest(-1), |c| c.vocal_rest.minutes = 25);
 
         let mut off = base.clone();
         off.hud.enabled = false;
-        off.audio.mic_mode = MicMode::Processed;
-        off.hud.placement = Placement::LeftWrist;
         off.hud.display = DisplayMode::Detailed;
         off.target.preset = Preset::Masculine;
         off.reminder.enabled = true;
         expect_cfg(&off, Control::HudEnabled(true), |c| c.hud.enabled = true);
-        expect_cfg(&off, Control::MicMode(MicMode::Bypass), |c| c.audio.mic_mode = MicMode::Bypass);
-        expect_cfg(&off, Control::Placement(Placement::Head), |c| c.hud.placement = Placement::Head);
         expect_cfg(&off, Control::Display(DisplayMode::Color), |c| c.hud.display = DisplayMode::Color);
         expect_cfg(&off, Control::Preset(Preset::Feminine), |c| c.target.preset = Preset::Feminine);
         expect_cfg(&off, Control::ReminderEnabled(false), |c| c.reminder.enabled = false);
@@ -1665,9 +1562,9 @@ mod tests {
             let (x, y) = (w.rect.cx(), w.rect.cy());
             assert_eq!(panel.hit(x, y), Some(i), "{:?} overlaps another control", w.control);
         }
-        // 3 tabs, 17 HUD (2+3+2+2+2+6), 11 target (3+4+4), 8 reminder, 2 vocal rest, 2 mic,
-        // 2 autostart, quit.
-        assert_eq!(panel.widgets.len(), 46);
+        // 3 tabs, 14 HUD (2+2+2+2+6), 11 target (3+4+4), 12 out of range (4 zone + 8 tone),
+        // 2 vocal rest, 2 autostart, quit.
+        assert_eq!(panel.widgets.len(), 45);
     }
 
     #[test]
@@ -1683,7 +1580,7 @@ mod tests {
     fn clicking_the_selected_option_is_a_no_op() {
         let base = Config::default();
         assert_eq!(click_control(&base, &live(), Control::HudEnabled(true)), None);
-        assert_eq!(click_control(&base, &live(), Control::Placement(Placement::Head)), None);
+        assert_eq!(click_control(&base, &live(), Control::Display(DisplayMode::Color)), None);
         assert_eq!(click_control(&base, &live(), Control::Autostart(false)), None);
     }
 
@@ -1865,11 +1762,17 @@ mod tests {
     #[test]
     fn resonance_controls_hit_and_produce_their_actions() {
         let on = on_cfg();
-        let mut panel = panel_on(Page::Resonance, &on, &live());
-        let relaxed = Control::Record(CalibWhich::Relaxed);
-        let target = Control::Record(CalibWhich::Target);
-        assert_eq!(click(&mut panel, relaxed), Some(Action::StartCalibration(CalibWhich::Relaxed)));
-        assert_eq!(click(&mut panel, target), Some(Action::StartCalibration(CalibWhich::Target)));
+        let fresh = |cfg: &Config| panel_on(Page::Resonance, cfg, &live());
+        let mut want = on.clone();
+        want.resonance.relaxed_df_hz = 1050.0;
+        assert_eq!(click(&mut fresh(&on), Control::RelaxedDf(50)), Some(Action::SetConfig(want)));
+        let mut want = on.clone();
+        want.resonance.target_df_hz = 1140.0;
+        assert_eq!(click(&mut fresh(&on), Control::TargetDf(-10)), Some(Action::SetConfig(want)));
+        let mut floor = on.clone();
+        floor.resonance.relaxed_df_hz = 500.0;
+        assert_eq!(click(&mut fresh(&floor), Control::RelaxedDf(-10)), None, "clamped at 500 Hz");
+        let mut panel = fresh(&on);
         assert_eq!(click(&mut panel, Control::ResonanceEnabled(true)), None, "already on");
         assert_eq!(panel.view.card, None);
         let mut off = on.clone();
@@ -1909,7 +1812,7 @@ mod tests {
         assert_eq!(click(&mut panel, Control::CardTurnOn), Some(Action::SetConfig(want.clone())));
         assert_eq!(panel.view.card, None);
         assert!(panel.render(&want, &live()).is_some());
-        assert!(is_enabled(&panel, Control::Record(CalibWhich::Relaxed)));
+        assert!(is_enabled(&panel, Control::RelaxedDf(10)));
 
         // "Keep off" emits nothing, closes the card and leaves resonance off.
         let mut panel = panel_on(Page::Resonance, &cfg, &live());
@@ -1923,33 +1826,22 @@ mod tests {
     }
 
     #[test]
-    fn resonance_controls_are_disabled_when_off_busy_or_processed() {
-        let relaxed = Control::Record(CalibWhich::Relaxed);
-        let target = Control::Record(CalibWhich::Target);
+    fn reference_steppers_are_disabled_while_off() {
         let cfg = Config::default();
         let mut panel = panel_on(Page::Resonance, &cfg, &live());
-        for c in [Control::HowItWorks, relaxed, target] {
+        for c in [Control::HowItWorks, Control::RelaxedDf(10), Control::TargetDf(-50)] {
             assert!(!is_enabled(&panel, c), "{c:?}");
             assert_eq!(click(&mut panel, c), None);
         }
         assert_eq!(panel.view.card, None);
-
-        let on = on_cfg();
-        let mut busy = live();
-        busy.resonance.relaxed = CalibStatus::Recording { progress: 0.4 };
-        let panel = panel_on(Page::Resonance, &on, &busy);
-        assert!(!is_enabled(&panel, relaxed) && !is_enabled(&panel, target));
-        assert!(is_enabled(&panel, Control::HowItWorks));
-
-        let mut processed = live();
-        processed.resonance.position = Some(ResonanceView::NeedsBypass);
-        let panel = panel_on(Page::Resonance, &on, &processed);
-        assert!(!is_enabled(&panel, relaxed) && !is_enabled(&panel, target));
+        let panel = panel_on(Page::Resonance, &on_cfg(), &live());
+        assert!(is_enabled(&panel, Control::RelaxedDf(-50)) && is_enabled(&panel, Control::TargetDf(50)));
     }
 
     #[test]
     fn every_resonance_control_is_reachable_and_inside_the_viewport() {
-        let cases = [(on_cfg(), None, 9), (Config::default(), Some(Card::Enable), 2), (on_cfg(), Some(Card::Info), 1)];
+        // On: 3 tabs, quit, switch (2), how, 2 × 4 reference steppers.
+        let cases = [(on_cfg(), None, 15), (Config::default(), Some(Card::Enable), 2), (on_cfg(), Some(Card::Info), 1)];
         for (cfg, card, count) in cases {
             let mut panel = SettingsPanel::new();
             panel.show(Page::Resonance, card);
@@ -2021,21 +1913,12 @@ mod tests {
         assert!(panel.render(&on, &l).is_none(), "same text");
         l.resonance.position = Some(ResonanceView::Position(1.2));
         assert!(panel.render(&on, &l).is_some());
-        l.resonance.target = CalibStatus::Recording { progress: 0.5 };
+        l.resonance.reading_hz = Some(1000.2);
         assert!(panel.render(&on, &l).is_some());
-        l.resonance.target = CalibStatus::Recording { progress: 0.502 };
-        assert!(panel.render(&on, &l).is_none(), "same percent");
-        l.resonance.target = CalibStatus::Recording { progress: 0.6 };
-        assert!(panel.render(&on, &l).is_some());
-        l.resonance.target = CalibStatus::Failed("a".into());
-        assert!(panel.render(&on, &l).is_some());
-        assert!(panel.render(&on, &l).is_none());
-        l.resonance.target = CalibStatus::Failed("b".into());
-        assert!(panel.render(&on, &l).is_some());
-        l.resonance.relaxed = CalibStatus::Done { df_hz: 1000.2 };
-        assert!(panel.render(&on, &l).is_some());
-        l.resonance.relaxed = CalibStatus::Done { df_hz: 1000.4 };
+        l.resonance.reading_hz = Some(1000.4);
         assert!(panel.render(&on, &l).is_none(), "same displayed Hz");
+        l.resonance.reading_hz = Some(1003.0);
+        assert!(panel.render(&on, &l).is_some());
         panel.show(Page::General, None);
         assert!(panel.render(&on, &l).is_some());
         assert!(panel.render(&on, &l).is_none());
@@ -2051,9 +1934,7 @@ mod tests {
         assert_eq!(p(1.3), STRINGS.res_beyond_target);
         assert_eq!(p(f32::NAN), STRINGS.res_gathering);
         assert_eq!(position_text(Some(ResonanceView::Gathering)), STRINGS.res_gathering);
-        assert_eq!(position_text(Some(ResonanceView::Uncalibrated)), STRINGS.res_uncalibrated);
         assert_eq!(position_text(Some(ResonanceView::TooSimilar)), STRINGS.res_too_similar);
-        assert_eq!(position_text(Some(ResonanceView::NeedsBypass)), STRINGS.res_needs_bypass);
     }
 
     fn update_live(status: UpdateStatus, available: Option<&str>) -> LiveInfo {

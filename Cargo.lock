@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "frame-vocal-pitch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fvp-audio",
  "fvp-config",
@@ -256,8 +256,9 @@ dependencies = [
 
 [[package]]
 name = "fvp-audio"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "libc",
  "log",
  "pipewire",
  "rtrb",
@@ -265,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "fvp-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "serde",
@@ -274,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "fvp-openvr"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ash",
  "libloading",
@@ -282,14 +283,14 @@ dependencies = [
 
 [[package]]
 name = "fvp-pitch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "realfft",
 ]
 
 [[package]]
 name = "fvp-ui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fontdue",
  "fvp-config",

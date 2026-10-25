@@ -163,7 +163,7 @@ fn assert_no_accepted_frames(signal: &[f32], what: &str) {
     assert!(hops >= 290, "{what}: {hops} hops");
     assert_eq!(tracker.reading(), None, "{what}");
     assert_eq!(
-        tracker.state(Some(1000.0), Some(1200.0)),
+        tracker.state(1000.0, 1200.0),
         ResonanceState::Gathering,
         "{what}"
     );
@@ -273,76 +273,8 @@ fn window_is_clamped() {
 }
 
 #[test]
-fn calibration_records_median_of_ten_seconds() {
-    let truth = formant_spacing(VOWELS[0].map(|f| f as f32));
-    let voice = vowel(RATE, 10.5, 150.0, VOWELS[0]);
-    let mut tracker = ResonanceTracker::new(RESONANCE_WINDOW_S);
-    let mut cal = Calibration::new();
-    assert_eq!(cal.progress(), 0.0);
-    for_each_hop(&voice, |hop, frame| {
-        cal.push(tracker.update(&hop, frame));
-    });
-    assert!(cal.is_done());
-    assert_eq!(cal.progress(), 1.0);
-    assert!(cal.accepted_s() > 9.0, "accepted {} s", cal.accepted_s());
-    let df = cal.finish().expect("calibration succeeds");
-    assert!((df / truth - 1.0).abs() < 0.05, "ΔF {df} vs {truth}");
-}
-
-#[test]
-fn calibration_with_little_speech_fails() {
-    // 2.5 s of voice inside 10 s of silence.
-    let mut signal = vowel(RATE, 2.5, 150.0, VOWELS[1]);
-    signal.extend(vec![0.0; RATE as usize * 8]);
-    let mut tracker = ResonanceTracker::new(RESONANCE_WINDOW_S);
-    let mut cal = Calibration::new();
-    for_each_hop(&signal, |hop, frame| {
-        cal.push(tracker.update(&hop, frame));
-    });
-    assert!(cal.is_done());
-    let err = cal.finish().unwrap_err();
-    let CalibError::NotEnoughSpeech { accepted_s } = err.clone();
-    assert!(accepted_s > 1.5 && accepted_s < 3.0, "{accepted_s}");
-    assert_eq!(
-        err.to_string(),
-        "Not enough clear speech — try again in a quiet place, speaking normally"
-    );
-
-    // Exactly at the threshold: 300 accepted hops pass, 299 fail.
-    let mut cal = Calibration::new();
-    for i in 0..1000 {
-        cal.push((i < 300).then_some(1000.0 + i as f32));
-    }
-    assert!(cal.finish().is_ok());
-    let mut cal = Calibration::new();
-    for i in 0..1000 {
-        cal.push((i < 299).then_some(1000.0));
-    }
-    assert!(cal.finish().is_err());
-}
-
-#[test]
-fn calibration_ignores_hops_after_ten_seconds() {
-    let mut cal = Calibration::new();
-    for _ in 0..1000 {
-        cal.push(None);
-    }
-    cal.push(Some(1000.0));
-    assert_eq!(cal.accepted_s(), 0.0);
-}
-
-#[test]
 fn position_mapping() {
-    let (relaxed, target) = (Some(1000.0), Some(1200.0));
-    assert_eq!(
-        position(Some(1000.0), None, target),
-        ResonanceState::Uncalibrated
-    );
-    assert_eq!(
-        position(Some(1000.0), relaxed, None),
-        ResonanceState::Uncalibrated
-    );
-    assert_eq!(position(None, None, None), ResonanceState::Uncalibrated);
+    let (relaxed, target) = (1000.0, 1200.0);
     assert_eq!(position(None, relaxed, target), ResonanceState::Gathering);
     assert_eq!(
         position(Some(1000.0), relaxed, target),
@@ -367,7 +299,7 @@ fn position_mapping() {
     );
     // Target darker than relaxed works the same way.
     assert_eq!(
-        position(Some(900.0), Some(1000.0), Some(800.0)),
+        position(Some(900.0), 1000.0, 800.0),
         ResonanceState::Position(0.5)
     );
 }
@@ -379,11 +311,11 @@ fn too_similar_below_five_percent() {
     assert!(!too_similar(1000.0, 1050.0));
     assert!(!too_similar(1000.0, 940.0));
     assert_eq!(
-        position(Some(1020.0), Some(1000.0), Some(1040.0)),
+        position(Some(1020.0), 1000.0, 1040.0),
         ResonanceState::TooSimilar
     );
     assert_eq!(
-        position(None, Some(1000.0), Some(1040.0)),
+        position(None, 1000.0, 1040.0),
         ResonanceState::TooSimilar
     );
 }
@@ -397,10 +329,9 @@ fn tracker_state_uses_smoothed_reading() {
     });
     let r = tracker.smoothed().expect("smoothed reading");
     assert_eq!(
-        tracker.state(Some(r), Some(r * 1.2)),
+        tracker.state(r, r * 1.2),
         ResonanceState::Position(0.0)
     );
-    assert_eq!(tracker.state(None, Some(r)), ResonanceState::Uncalibrated);
     tracker.reset();
     assert_eq!(tracker.reading(), None);
 }

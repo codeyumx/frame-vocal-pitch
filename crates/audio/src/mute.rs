@@ -1,5 +1,5 @@
-//! Mute detection (SPEC §4.1 / §6.3 step 5): `wpctl get-volume` on the default source, and on
-//! the hardware node while bypass is active, polled every 2 s on a small helper thread.
+//! Mute detection (SPEC §4.1 / §6.3): `wpctl get-volume` on the default source, polled every
+//! 2 s on a small helper thread.
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::capture::{Shared, NO_NODE};
+use crate::capture::Shared;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const DEFAULT_SOURCE_TARGET: &str = "@DEFAULT_AUDIO_SOURCE@";
@@ -66,7 +66,7 @@ impl Drop for MutePoller {
 fn poll_loop(shared: &Shared, stop: &mpsc::Receiver<()>) {
     let mut last_error: Option<String> = None;
     loop {
-        let mut report = |r: Result<bool, String>| match r {
+        let muted = match wpctl_muted(DEFAULT_SOURCE_TARGET) {
             Ok(m) => m,
             Err(e) => {
                 if last_error.as_deref() != Some(e.as_str()) {
@@ -76,10 +76,7 @@ fn poll_loop(shared: &Shared, stop: &mpsc::Receiver<()>) {
                 false
             }
         };
-        let default_muted = report(wpctl_muted(DEFAULT_SOURCE_TARGET));
-        let hw = shared.hw_node_id.load(Ordering::Relaxed);
-        let hw_muted = hw != NO_NODE && report(wpctl_muted(&hw.to_string()));
-        shared.muted.store(default_muted || hw_muted, Ordering::Relaxed);
+        shared.muted.store(muted, Ordering::Relaxed);
         match stop.recv_timeout(POLL_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {}
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,

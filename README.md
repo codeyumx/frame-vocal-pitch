@@ -3,9 +3,9 @@
 A small vocal pitch trainer that runs **on the Steam Frame headset itself** and shows, as a
 SteamVR overlay, whether your voice is inside your target pitch range.
 
-Look up, speak, and see one of five states: in range, out of range, no voice, mic muted, or no
+Look up, speak, and see one of six states: in range, too low, too high, no voice, mic muted, or no
 microphone. Settings live in a SteamVR dashboard tab, so you can change the target range, the
-overlay placement and the reminder tone from inside VR without a PC or a keyboard.
+overlay position and the reminder tone from inside VR without a PC or a keyboard.
 
 > **Unofficial.** This is a personal project. It is not affiliated with, endorsed by or supported
 > by Valve Corporation. Steam, SteamVR and Steam Frame are trademarks of Valve Corporation.
@@ -50,7 +50,7 @@ url=https://github.com/codeyumx/frame-vocal-pitch/releases/latest/download/insta
 curl -fsSL "$url" | bash -s -- --autostart           # start with SteamVR
 curl -fsSL "$url" | bash -s -- --no-autostart        # do not start with SteamVR
 curl -fsSL "$url" | bash -s -- --version             # version that would be installed
-curl -fsSL "$url" | bash -s -- --release v0.3.0      # install that release instead of the latest
+curl -fsSL "$url" | bash -s -- --release v0.4.0      # install that release instead of the latest
 curl -fsSL "$url" | bash -s -- --uninstall           # remove, keep the configuration
 curl -fsSL "$url" | bash -s -- --uninstall --purge   # remove, including the configuration
 ```
@@ -104,10 +104,12 @@ Re-running the one-line install command always works as well and installs the la
 
 ## Using it
 
-- Turn the overlay on in the dashboard tab **Vocal Pitch**: the HUD panel follows your head
-  (`head`) or sits on the back of a wrist (`left_wrist`, `right_wrist`).
+- Turn the overlay on in the dashboard tab **Vocal Pitch**: the HUD panel follows your head; nudge
+  its position from the same tab.
 - Pick a target preset (`feminine` 165–255 Hz, `masculine` 85–180 Hz) or a custom band. Green is
-  in range, red is out of range, dark grey is silence.
+  in range; just below it is yellow (raise your voice), just above it orange (lower it), further
+  out red. The width of the yellow/orange zone is adjustable (default ±10 Hz, 0 turns it off).
+  Dark grey is silence.
 - Adjust size, opacity, position nudges, fade time and, if you want it, a reminder tone that
   beeps after you stay out of range for a configurable delay.
 - Vocal rest can remind you to stop after 5–50 minutes of voiced time in the last hour.
@@ -141,13 +143,13 @@ differently from what you want, or sit below it and still read as intended.
 ### Resonance indicator (experimental, off by default)
 
 On the dashboard's **Resonance (experimental)** page you can turn on a rough brightness indicator.
-Record 10 s of your relaxed voice and 10 s of your target voice; the HUD (Display: Detailed) then
-shows a slow-moving marker between "relaxed" and "target". It compares you only with your own
-recordings and needs the bypass mic mode.
+The page shows your current reading in Hz: speak in your relaxed voice and set **Relaxed** to that
+number, then do the same in your target voice for **Target**. The HUD (Display: Detailed) then shows
+a slow-moving marker between "relaxed" and "target". It compares you only with those two values.
 
 Turn it off if it doesn't help you, in particular if:
-- you speak a different language or accent in VR than in your recordings, or switch often (vowels
-  differ between languages and move the estimate; re-record in the language you use);
+- you speak a different language or accent in VR than when you set the values, or switch often
+  (vowels differ between languages and move the estimate; set them again in the language you use);
 - you whisper, sing, shout, speak above ~300 Hz, or are in a noisy room;
 - your goal isn't about how bright or dark your voice sounds;
 - watching it makes you tense, or it doesn't match what you hear or what people you trust tell you.
@@ -155,17 +157,13 @@ Turn it off if it doesn't help you, in particular if:
 It cannot tell you how others hear your voice; a voice coach or a trusted listener can. Details:
 [`SPEC.md` §5.1](SPEC.md#51-resonance-feedback-experimental-opt-in).
 
-## Microphone: bypassing Valve's processing for this app only
+## Microphone
 
-The Frame processes its microphone in the default path (EQ and downmix, echo cancellation with
-automatic gain control, then noise suppression with a voice gate). That is right for calls and
-games, but it makes pitch tracking worse: the level is levelled by AGC, quiet onsets get gated to
-silence and echo cancellation can thin the voice out. So by default the app records the **hardware
-mic node directly**, using a stream that WirePlumber never links, and creates its own PipeWire
-links to the hardware ports. Every other application keeps the processed microphone. The setting
-**Mic input** in the dashboard switches to the processed path if you prefer it. Details, including
-the fallback when the hardware node cannot be found, are in
-[`SPEC.md` §6.3](SPEC.md#63-mic-input-mode-mic_mode--bypass--processed).
+The app records the Frame's default microphone like any other app, so Valve's processing applies
+(EQ and downmix, and while active, echo cancellation with automatic gain control and noise
+suppression with a voice gate). Pitch tracking copes with that; the resonance indicator is rougher
+for it. SteamOS hides the raw hardware mic node from applications, and the app does not try to get
+around that. Details are in [`SPEC.md` §6.3](SPEC.md#63-mic-input).
 
 The app never changes the system-wide audio configuration and never touches Valve's mic filters.
 
@@ -209,8 +207,7 @@ The installer and the app were written around the Frame's known audio hazards:
   Link. Restarting the *unit* (`systemctl --user restart frame-vocal-pitch`) is all an update does.
 - **Never writes ALSA mixer controls.** Some of them default to 0 and would silence the mic.
 - **Never writes WirePlumber/PipeWire configuration or the `filters` metadata.** Valve's smart
-  filters are global; enabling or disabling them would change the microphone for every app. The
-  bypass in §6.3 only affects this app's own stream and its own links.
+  filters are global; enabling or disabling them would change the microphone for every app.
 - **Never changes the default source** and never remaps anything system-wide.
 
 ## License

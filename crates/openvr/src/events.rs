@@ -65,12 +65,6 @@ pub enum Event {
     OverlayClosed(OverlayHandle),
     DashboardActivated,
     DashboardDeactivated,
-    /// `VREvent_TrackedDeviceActivated` for the given device index.
-    DeviceConnected(u32),
-    /// `VREvent_TrackedDeviceDeactivated` for the given device index.
-    DeviceDisconnected(u32),
-    /// `VREvent_TrackedDeviceRoleChanged`: controller roles must be re-resolved.
-    DeviceRoleChanged(u32),
 }
 
 /// Which queue an event came from.
@@ -90,14 +84,10 @@ pub(crate) enum Source {
 /// either queue (the runtime may deliver dashboard events on both).
 pub(crate) fn decode(raw: &VREvent, source: Source) -> Option<Event> {
     let event_type = raw.eventType;
-    let device = raw.trackedDeviceIndex;
     let global = match event_type {
         ffi::VR_EVENT_QUIT => Some(Event::Quit),
         ffi::VR_EVENT_DASHBOARD_ACTIVATED => Some(Event::DashboardActivated),
         ffi::VR_EVENT_DASHBOARD_DEACTIVATED => Some(Event::DashboardDeactivated),
-        ffi::VR_EVENT_TRACKED_DEVICE_ACTIVATED => Some(Event::DeviceConnected(device)),
-        ffi::VR_EVENT_TRACKED_DEVICE_DEACTIVATED => Some(Event::DeviceDisconnected(device)),
-        ffi::VR_EVENT_TRACKED_DEVICE_ROLE_CHANGED => Some(Event::DeviceRoleChanged(device)),
         _ => None,
     };
     if global.is_some() {
@@ -184,18 +174,6 @@ mod tests {
         assert_eq!(
             decode(&raw(503, 0, &[]), Source::System),
             Some(Event::DashboardDeactivated)
-        );
-        assert_eq!(
-            decode(&raw(100, 3, &[]), Source::System),
-            Some(Event::DeviceConnected(3))
-        );
-        assert_eq!(
-            decode(&raw(101, 4, &[]), Source::System),
-            Some(Event::DeviceDisconnected(4))
-        );
-        assert_eq!(
-            decode(&raw(108, 5, &[]), Source::System),
-            Some(Event::DeviceRoleChanged(5))
         );
         // Global events are also accepted from an overlay queue.
         assert_eq!(

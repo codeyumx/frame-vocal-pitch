@@ -202,6 +202,8 @@ fn render_png_writes_every_state() {
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     for name in [
         "hud-color-in_range.png",
+        "hud-color-too_low.png",
+        "hud-color-too_high.png",
         "hud-color-out_of_range.png",
         "hud-color-no_voice.png",
         "hud-color-muted.png",

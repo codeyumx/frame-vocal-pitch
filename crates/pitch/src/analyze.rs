@@ -1,7 +1,7 @@
 //! Offline helpers behind the `--analyze` and `--bench` CLI modes.
 
 use crate::params::{PitchParams, INPUT_RATE_HZ, RESONANCE_WINDOW_S};
-use crate::resonance::{Calibration, ResonanceTracker};
+use crate::resonance::ResonanceTracker;
 use crate::tracker::{Class, Tracker};
 use crate::yin::{Detector, Hop};
 use std::time::Instant;
@@ -63,8 +63,7 @@ fn run_pipeline(signal: &[f32], hops: &mut Vec<Hop>) -> usize {
 /// Measures detector + tracker + resonance cost (SPEC §5.1 CPU line) and
 /// returns the mean wall time per 10 ms hop in microseconds. The signal is a
 /// cycle of synthetic vowels /a/ /i/ /u/ at 150 Hz, so every hop is voiced
-/// below 300 Hz and runs the full formant analysis (worst case), and a
-/// calibration recorder is fed alongside as during a recording.
+/// below 300 Hz and runs the full formant analysis (worst case).
 pub fn bench_resonance() -> f64 {
     let signal = synth::vowel_cycle(INPUT_RATE_HZ, BENCH_SECONDS, 150.0);
     // Warm-up pass (page faults, caches, CPU clock ramp).
@@ -78,17 +77,15 @@ fn run_resonance_pipeline(signal: &[f32]) -> usize {
     let mut detector = Detector::new(PitchParams::default(), INPUT_RATE_HZ);
     let mut tracker = Tracker::new(165.0, 255.0);
     let mut resonance = ResonanceTracker::new(RESONANCE_WINDOW_S);
-    let mut calibration = Calibration::new();
     let mut count = 0;
     for chunk in signal.chunks(BENCH_CHUNK) {
         detector.push_with(chunk, |hop, frame| {
             std::hint::black_box(tracker.update(&hop));
-            calibration.push(resonance.update(&hop, frame));
-            std::hint::black_box(resonance.state(Some(1000.0), Some(1200.0)));
+            std::hint::black_box(resonance.update(&hop, frame));
+            std::hint::black_box(resonance.state(1000.0, 1200.0));
             count += 1;
         });
     }
-    std::hint::black_box(calibration.finish().ok());
     count
 }
 

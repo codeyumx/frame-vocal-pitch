@@ -11,7 +11,7 @@ This document is the only input for implementation. See [Clean-room rules](#clea
 
 ### Goals
 - Real-time detection of the speaking fundamental frequency (F0) from the Frame's microphone.
-- A glanceable in-headset indicator: in range / out of range / no voice / mic muted.
+- A glanceable in-headset indicator: in range / too low / too high / no voice / mic muted.
 - Settings reachable from inside VR (SteamVR dashboard tab); no PC or keyboard needed.
 - Install from the Frame's terminal with one command; starts automatically with SteamVR if the user opts in.
 - Low power: no rendering or GPU work while nothing visible changes or the headset is off the head.
@@ -19,10 +19,10 @@ This document is the only input for implementation. See [Clean-room rules](#clea
 ### Non-goals (v1)
 - Desktop/PC version, Windows support, streaming-mode (PC SteamVR) support.
 - Teaching voice technique, recording sessions to disk, judging how a voice will be perceived.
-  Resonance feedback exists only as the opt-in, self-calibrated, experimental indicator of §5.1.
+  Resonance feedback exists only as the opt-in, experimental indicator of §5.1.
 - Push-to-talk key emulation (there is no local voice-chat client to drive on the headset).
 - Changing the Frame's **system-wide** audio setup: WirePlumber/PipeWire config files, the `filters`
-  metadata, default devices, ALSA mixer. The processing bypass in §6.3 affects this app's input only.
+  metadata, default devices, ALSA mixer.
 
 ---
 
@@ -67,10 +67,18 @@ Facts observed on the Frame:
   feeds the wrapper directly.
 - The user's mic mute (`wpctl set-mute @DEFAULT_AUDIO_SOURCE@`) acts on the wrapper node, not on the
   hardware node.
+- SteamOS hides the hardware mic node, the wrapper's loopback stream and every node with
+  `steamos.mic_filter = true` from applications on the normal `pipewire-0` socket
+  (`/etc/wireplumber/wireplumber.conf.d/10-access.conf`, permission manager `steamos-default`:
+  empty permissions on those nodes). Such clients see only the wrapper source; they cannot resolve
+  or link the hardware node. Tools on `pipewire-0-manager` (`wpctl`, `pw-dump`, `pw-link`) see
+  everything, which is why the topology above is visible from a shell but not from an app.
 
-Consequences of the processed path for pitch tracking: amplitude is unreliable (AGC), quiet onsets may be
-gated to silence (noise suppression), echo cancellation can attenuate the voice. The app therefore
-defaults to reading the hardware node directly for itself only (§6.3).
+Consequences for pitch tracking: amplitude is unreliable (AGC), quiet onsets may be gated to silence
+(noise suppression), echo cancellation can attenuate the voice. The app nevertheless records the
+processed default source (§6.3): reading the hardware node would require sidestepping Valve's access
+policy, which the app deliberately does not do. Pitch detection is robust to these stages; the
+resonance indicator (§5.1) is less accurate on processed audio.
 
 ---
 
@@ -89,9 +97,9 @@ flowchart LR
   CFG --> AN
 ```
 
-- **Capture thread**: PipeWire thread loop; owns the capture stream and, in bypass mode, the links it
-  creates (§6.3). The process callback only copies samples (downmixed to mono by averaging channels)
-  into a lock-free single-producer/single-consumer ring buffer (no allocation, no locks, no logging).
+- **Capture thread**: PipeWire thread loop; owns the capture stream (§6.3). The process callback only
+  copies samples (downmixed to mono by averaging channels) into a lock-free
+  single-producer/single-consumer ring buffer (no allocation, no locks, no logging).
 - **Analysis thread**: pulls hops from the ring buffer, runs pitch detection (§5), publishes the latest
   `PitchState` (F0 Hz or none, voicing confidence, classification, timestamp) via an atomic/seqlock.
 - **Main loop**: one `poll()`-style wait whose timeout is the nearest deadline (render tick, OpenVR
@@ -134,11 +142,9 @@ Crates (suggested, not mandatory): `ash` (Vulkan), `pipewire` (capture/playback)
 ### 4.1 HUD overlay (key `codeyumx.frame-vocal-pitch.hud`)
 A small panel attached to a tracked device via `SetOverlayTransformTrackedDeviceRelative`.
 
-Placement modes (setting `placement`):
-- `head` (default): relative to the HMD; default offset x = −0.12 m, y = −0.10 m, z = −0.6 m, facing the eye.
-- `left_wrist` / `right_wrist`: relative to the controller with that role; panel faces up from the back
-  of the wrist. Re-resolve the controller index every 1 s and on device-connect events. Fade alpha
-  to 0 as the panel normal turns more than 75° away from the HMD direction.
+Placement: relative to the HMD, default offset x = −0.12 m, y = −0.10 m, z = −0.6 m, facing the eye
+(the only placement; wrist placements were removed after 0.3.0 because they did not work on the
+Frame, and an old `hud.placement` key is ignored).
 
 Content (setting `display`):
 - `color` (default): a rounded tile filled with the state colour.
@@ -152,10 +158,17 @@ States and default colours:
 | State | Condition | Colour |
 |---|---|---|
 | `in_range` | voiced, F0 within target band | green `#2EBD59` |
-| `out_of_range` | voiced, F0 outside target band | red `#D9433B` |
+| `too_low` | voiced, out of range below the band by at most `target.near_hz`: raise the voice | yellow `#F2C94C`, dark glyphs |
+| `too_high` | voiced, out of range above the band by at most `target.near_hz`: lower the voice | orange `#F07F2E`, dark glyphs |
+| `out_of_range` | voiced, further than `target.near_hz` outside the band (either side), or any out-of-range voice when `near_hz = 0` | red `#D9433B` |
 | `no_voice` | unvoiced / silence | dark grey `#202020`, 60 % alpha |
-| `muted` | default source muted (`wpctl get-volume @DEFAULT_AUDIO_SOURCE@` reports `[MUTED]`, polled every 2 s). Applies in both mic modes: in bypass mode the hardware node is not muted by the user's mute, so the app must discard input itself while muted | grey with a crossed-mic glyph |
-| `no_mic` | capture stream failed, links could not be made, or no buffers for 3 s | amber `#E0A030` with `!` |
+| `muted` | default source muted (`wpctl get-volume @DEFAULT_AUDIO_SOURCE@` reports `[MUTED]`, polled every 2 s); input is discarded while muted | grey with a crossed-mic glyph |
+| `no_mic` | capture stream failed or no buffers for 3 s | blue `#3D7DD8` with `!` |
+
+`too_low` / `too_high` / `out_of_range` split the tracker's single `out_of_range` class (§5). The side
+is decided by the band's geometric centre √(low·high), because the ±2 Hz hysteresis can keep
+`out_of_range` slightly inside an edge (that counts as near). Without an F0 the previous state is
+kept. The reminder tone (§5) keys on the tracker class, so the colours give direction without a tone.
 
 Colour transitions animate over 300 ms (configurable `fade_ms`, 0 disables). Animate only while a
 transition is in progress; otherwise render nothing new.
@@ -176,9 +189,10 @@ overlay is handled exactly like the Quit button (clean shutdown, exit status 3).
 keep running after its tab was closed.
 
 Controls (each writes the config file immediately):
-- HUD on/off; placement; display mode; size; opacity; position nudges (up/down/left/right/closer/further).
+- HUD on/off; display mode; size; opacity; position nudges (up/down/left/right/closer/further).
 - Target preset: `feminine` (165–255 Hz), `masculine` (85–180 Hz), `custom`.
 - Custom range: low/high with ±1 Hz and ±10 Hz steppers; low < high enforced, ≥ 10 Hz gap.
+- Yellow/orange zone (`target.near_hz`): stepper ±1/±5 Hz, 0–50, "Off" at 0; applies to every preset.
 - Live strip: current F0 and state (so the user can test settings while speaking).
 - Reminder tone: on/off, delay (0.5–10 s), pitch (100–1000 Hz), volume (0–100 %).
 - Vocal rest: off or 5–50 min of voiced time per rolling 60 min.
@@ -187,13 +201,13 @@ Controls (each writes the config file immediately):
   available", "Checking…", "Updating to X.Y.Z…", "Update failed: <reason>", "Couldn't check: <reason>"),
   buttons "Check now" and, only when a newer release exists, "Update to X.Y.Z" (asks for a second
   click "Confirm update" within 10 s, so a stray click cannot start it). Toggle "Check automatically".
-- Mic input: **"Bypass Valve processing (this app only)"** (default) / "Use processed mic". Below it a
-  status line (§6.3) naming the node actually recorded from and any fallback reason.
+- Status line under "Microphone & startup" (§6.3): the source recorded from, mute, and the current
+  capture problem if any.
 - Quit (exits with status 3 so the service does not restart it). Label "Quit" plus a one-line hint
   under it: "Stops the app until SteamVR starts again" when autostart is on, "Stops the app" otherwise.
 - Resonance (experimental), §5.1: off by default. Turning it on first shows the explanation card
-  (§5.1 "User guidance") with "Turn on" / "Keep off". When on: "Record relaxed voice (10 s)",
-  "Record target voice (10 s)" with progress and result, the current position as text, and a
+  (§5.1 "User guidance") with "Turn on" / "Keep off". When on: the current reading in Hz, "Relaxed"
+  and "Target" reference values with ±10/±50 Hz steppers, the current position as text, and a
   "How this works" button that re-opens the card.
 
 Text strings live in one table; English required, layout must tolerate 30 % longer strings.
@@ -243,9 +257,9 @@ Acceptance (unit tests on synthetic 48 kHz signals):
 - CPU budget: analysis < 2 % of one core on the Frame (measure with `--bench`).
 
 ### 5.1 Resonance feedback (experimental, opt-in)
-Purpose: show whether the user's voice is drifting **darker or brighter relative to their own two
-calibration recordings**. It is not a verdict on how the voice sounds to others, has no "in range"
-state, never changes the tile colour and never triggers the reminder tone.
+Purpose: show whether the user's voice is drifting **darker or brighter relative to two reference
+values the user sets** from their own voice. It is not a verdict on how the voice sounds to others,
+has no "in range" state, never changes the tile colour and never triggers the reminder tone.
 
 Measurement (on the 16 kHz signal the pitch path already produces):
 - Frames of 25 ms every 10 ms, only on hops the pitch path marks voiced with F0 ≤ 300 Hz (above that,
@@ -258,28 +272,28 @@ Measurement (on the 16 kHz signal the pitch path already produces):
   over i = 1..3: ΔF = Σ Fi·(2i−1)/2 ÷ Σ ((2i−1)/2)². Higher ΔF = brighter.
 - Displayed value R = median ΔF over the voiced frames of the last 8 s (`resonance.window_s`).
   Needs ≥ 2 s of accepted frames in the window; otherwise state "gathering" (marker hidden, bar dim).
-- Only in bypass mode (§6.3). When the active mic mode is processed, show "Resonance needs the
-  bypass mic mode" and hide the marker: Valve's EQ changes the spectrum.
+- Runs on the processed default source (§6.3). Valve's EQ, noise suppression and AGC colour the
+  spectrum, so readings are rougher than on a raw signal.
 
-Calibration:
-- "Record relaxed voice" / "Record target voice": 10 s each; the value stored is the median ΔF of the
-  accepted frames. Fails with a clear message if fewer than 3 s of frames were accepted ("Not enough
-  clear speech — try again in a quiet place, speaking normally").
-- If |target − relaxed| < 5 % of relaxed: store both, but show "These two recordings are too similar
-  to tell apart; the indicator will not be useful" and keep the marker hidden.
+Reference values (replaced the 10 s calibration recordings after 0.3.0):
+- `resonance.relaxed_df_hz` and `resonance.target_df_hz`, numbers in Hz (defaults 1000 / 1150, range
+  500–2000), set with steppers on the resonance page. The page shows the current smoothed reading R
+  ("Current reading: 1043 Hz", "—" while gathering) so the user can speak in each voice and copy the
+  reading into the matching value.
+- If |target − relaxed| < 5 % of relaxed: show "The relaxed and target values are too close to tell
+  apart" and keep the marker hidden.
 - Position p = (R − relaxed) / (target − relaxed), shown clamped to −0.25…1.25 on the bar with ticks
   at 0 ("relaxed") and 1 ("target"). Text: "Brightness: near relaxed / between / near target /
   beyond target". Changes in p are smoothed (EMA, 1 s time constant); the marker moves slowly by design.
-- Without both calibrations the bar shows "Calibrate in settings".
 
 User guidance (the explanation card; text in the string table, plain language, ≤ 120 words visible
 without scrolling, rest scrollable):
-- What it is: an estimate of how bright or dark your voice sounds, compared with your own two
-  recordings. It moves slowly and is rough.
+- What it is: an estimate of how bright or dark your voice sounds, compared with two reference
+  values set from your own voice. It moves slowly and is rough.
 - When it may not help — **turn it off if any of these apply or if it does not match what you hear
   or what people you trust tell you**:
-  - You speak a different language or accent in VR than in your calibration, or switch often
-    (vowels differ between languages and accents, and they move the estimate). Recalibrate in the
+  - You speak a different language or accent in VR than when you set the values, or switch often
+    (vowels differ between languages and accents, and they move the estimate). Set them again in the
     language you are using.
   - Whispering, singing, shouting, very high pitch (above ~300 Hz it cannot measure), or a noisy room.
   - Your goal is not about how bright or dark your voice sounds.
@@ -296,9 +310,7 @@ three second-order formant resonators, 48 kHz input):
   the harmonics (known limitation of autocorrelation LPC at high F0) — the test records the measured
   deviation instead of asserting it. The R scaling test above is the binding requirement at all F0s.
 - F0 = 350 Hz input, noise and silence → no accepted frames.
-- Calibration: fewer than 3 s accepted → error; < 5 % apart → "too similar" state; p = 0 at relaxed,
-  1 at target, clamped display.
-- Processed mic mode → indicator unavailable state.
+- Reference values: < 5 % apart → "too similar" state; p = 0 at relaxed, 1 at target, clamped display.
 - CPU: pitch + resonance together < 3 % of one core on the Frame (`--bench` prints both).
 
 ---
@@ -318,26 +330,28 @@ strings → default and a log line):
 | Table.key | Type | Default | Range / values |
 |---|---|---|---|
 | `hud.enabled` | bool | `true` | |
-| `hud.placement` | string | `"head"` | `head`, `left_wrist`, `right_wrist` |
 | `hud.display` | string | `"color"` | `color`, `detailed` |
 | `hud.size_m` | float | 0.05 | 0.02–0.20 |
 | `hud.opacity` | float | 0.9 | 0.1–1.0 |
-| `hud.nudge_x_m`, `hud.nudge_y_m`, `hud.nudge_z_m` | float | 0.0 | ±0.5; added to the placement's built-in offset; dashboard step 0.01 m |
+| `hud.nudge_x_m`, `hud.nudge_y_m`, `hud.nudge_z_m` | float | 0.0 | ±0.5; added to the built-in offset; dashboard step 0.01 m |
 | `hud.fade_ms` | int | 300 | 0–2000 |
 | `target.preset` | string | `"feminine"` | `feminine`, `masculine`, `custom` |
 | `target.custom_low_hz`, `target.custom_high_hz` | float | 165, 255 | within detection span; low ≤ high − 10 |
+| `target.near_hz` | float | 10 | 0–50; yellow/orange zone width outside the band (§4.1), 0 = off; dashboard steps ±1/±5 |
 | `reminder.enabled` | bool | `false` | |
 | `reminder.delay_s` | float | 2.0 | 0.5–10 |
 | `reminder.pitch_hz` | float | 440 | 100–1000 |
 | `reminder.volume` | float | 0.5 | 0–1 |
 | `vocal_rest.minutes` | int | 0 | 0 = off, else 5–50 |
-| `audio.mic_mode` | string | `"bypass"` | `bypass`, `processed` (§6.3) |
 | `audio.detect_min_hz`, `audio.detect_max_hz` | float | 60, 500 | 40–1000, min ≤ max − 50 |
 | `audio.noise_floor_min_dbfs` | float | −60 | −90 to −20; lower clamp of the adaptive noise floor (§5) |
 | `resonance.enabled` | bool | `false` | §5.1; set only after the explanation card was acknowledged |
 | `resonance.window_s` | float | 8 | 4–20 |
-| `resonance.relaxed_df_hz`, `resonance.target_df_hz` | float or absent | absent | calibration results (§5.1); absent = not calibrated |
+| `resonance.relaxed_df_hz`, `resonance.target_df_hz` | float | 1000, 1150 | 500–2000; reference values (§5.1) |
 | `update.check` | bool | `true` | automatic update checks (§7.1); "Check now" and "Update" work either way |
+
+`audio.mic_mode` (versions ≤ 0.3.0) is no longer read; files containing it load normally and the
+key disappears on the next save.
 
 Autostart is not a config key: it is the enabled state of the systemd user unit (§7).
 
@@ -350,53 +364,33 @@ Autostart is not a config key: it is the enabled state of the systemd user unit 
   must record it as a normal stop, not a failure).
 - Logs to stderr (journald via the unit); `--verbose` raises level.
 
-### 6.3 Mic input mode (`mic_mode = "bypass" | "processed"`)
-The app never writes WirePlumber/PipeWire configuration or metadata. Both modes use only its own
-stream and, in bypass mode, links that it owns.
+### 6.3 Mic input
+The app never writes WirePlumber/PipeWire configuration or metadata and connects on the normal
+`pipewire-0` socket like any other application.
 
-**`processed`** — stream with `PW_STREAM_FLAG_AUTOCONNECT`, no target, `node.virtual` unset. WirePlumber
-links it to the default source through Valve's filters; the tracker counts it as mic use.
+One capture stream `node.name = frame-vocal-pitch-capture`, `PW_STREAM_FLAG_AUTOCONNECT`, no target,
+F32 48 kHz with the channel layout left to the graph (downmixed to mono in the process callback).
+WirePlumber links it to the default source, through Valve's smart filters when they are active; the
+mic tracker counts it as mic use (§2).
 
-**`bypass`** (default) — the app receives the raw hardware signal while every other app keeps the
-processed signal:
-1. **Resolve the hardware source.** Read `default.audio.source` from the `default` metadata. If that
-   node belongs to a `node.link-group` whose stream node has `target.object`, follow it to the node it
-   names; repeat until reaching a node that is not part of a link-group (the device node). For a
-   USB/Bluetooth mic set as default this is simply the default source itself.
-2. **Create the capture stream without autoconnect** (omit `PW_STREAM_FLAG_AUTOCONNECT`; set
-   `node.autoconnect = false`, `node.dont-reconnect = true`, `node.virtual = true`,
-   `node.name = frame-vocal-pitch-capture`). Because WirePlumber never links this stream, the smart
-   filter policy never applies to it. Because it is `node.virtual`, the tracker does not count it, so
-   the filters are not switched on for everyone just because the trainer is listening.
-   Format F32, 48 kHz, channel count and positions equal to the hardware node's output ports.
-3. **Link manually.** For each hardware output port, create a link with the `link-factory`
-   (`link.output.node`, `link.output.port`, `link.input.node`, `link.input.port`; `object.linger = false`)
-   to the stream input port with the same `audio.channel`. Keep the link proxies alive; they are
-   removed automatically when the app disconnects.
-4. **Watch the registry.** If the hardware node, a port or a link disappears, or `default.audio.source`
-   changes, drop the links and redo steps 1–3 within 1 s.
-5. **Mute.** Honour the user's mute on the default source (state `muted`, input discarded) and also a
-   mute on the hardware node itself.
-6. **Fallback.** If any step fails, switch to `processed` behaviour for this session and show the reason
-   (e.g. "Bypass unavailable: hardware mic node not found — using processed mic").
+- **Registry.** Node labels come from global properties (`node.name`, `node.description`,
+  `node.nick`); nodes are not bound. The `default` metadata is bound for `default.audio.source`,
+  whose node's label is the status line's source.
+- **Errors.** Only a core error with `id = 0` and `res = -EPIPE` means the connection is gone (drop
+  everything, reconnect after 2 s). Every other core error concerns a single object — e.g. `-ENOENT
+  "unknown resource N op:M"` when a proxy is destroyed after its global went away — and is logged at
+  debug level only. Treating those as disconnects recreated the stream in a loop on the Frame.
+- **Stream failure.** A stream error or unexpected disconnect drops the stream and recreates it after
+  2 s; the status line shows the reason meanwhile.
+- **Mute.** Honour the user's mute on the default source (state `muted`, input discarded).
 
-Status line shows: mode, node recorded from (description), and whether Valve's filters are currently
-active for other apps (read-only: `filter.smart.disabled` values in the `filters` metadata for nodes
-with `steamos.mic_filter = true`).
+Status line: "Recording from <source>", then "mic muted" and the current problem when present.
 
 On-device verification (required before release):
-- Bypass, no other recorder: `pw-link -l` shows `alsa_input…HiFi__Mic__source` ports → the app's
-  capture ports directly; `pw-metadata -n filters` still shows the mic filters disabled.
-- Bypass while another app records (e.g. `pw-record` or VRChat): that app's audio is processed (its
-  path goes through `eq_`/`echo_cancel_`/`ns_` nodes) and the trainer still receives raw audio.
-- Processed mode: the app's capture goes through the filters (same check as above).
-- Toggling mute, unplugging/plugging a USB mic and changing the default source each re-resolve.
-- Confirm on device that Valve's tracker ignores `node.virtual = true` streams as described.
-
-Validated off-device (PipeWire 1.6.10, WirePlumber 0.5.18, a test smart filter targeting a USB mic):
-an autoconnected recorder was routed through the filter; a recorder with `node.autoconnect = false`
-and manual links received the device directly; toggling `filter.smart.disabled` made WirePlumber
-relink the autoconnected recorder both ways while the manual links stayed in place.
+- `pw-link -l` shows the wrapper source's ports linked to `frame-vocal-pitch-capture`.
+- Pressing the volume buttons while the app runs moves the volume in normal steps; the app's log
+  shows no reconnects.
+- Toggling mute and changing the default source are reflected within 2 s.
 
 ### 6.4 CLI
 ```
@@ -404,8 +398,7 @@ frame-vocal-pitch                 run (normal mode)
 frame-vocal-pitch --version       prints "frame-vocal-pitch <semver>"
 frame-vocal-pitch --verbose
 frame-vocal-pitch --probe         print environment: SteamVR running?, OpenVR lib found?,
-                                  default source, resolved hardware source, mute state,
-                                  mic filter nodes and their filters-metadata state; exit
+                                  default source and its mute state; exit
 frame-vocal-pitch --analyze F.wav print time, F0, state per hop for a WAV file; exit
 frame-vocal-pitch --bench         run analysis on synthetic audio, print µs/hop; exit
 frame-vocal-pitch --render-png DIR
@@ -519,7 +512,7 @@ Acceptance:
 - CI (GitHub Actions, `ubuntu-latest`): build the same container, `cargo test` (x86_64),
   cross-build aarch64 release, package tarball + `SHA256SUMS`, attach to the release on tag push.
 - On-device checks (manual, via ssh): `--probe`, `--analyze` of a recording made on the Frame with
-  `pw-record`, HUD in all placements, dashboard tab, autostart across SteamVR restart, uninstall.
+  `pw-record`, HUD placement and nudges, dashboard tab, autostart across SteamVR restart, uninstall.
 
 ---
 

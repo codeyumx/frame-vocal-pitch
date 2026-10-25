@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use crate::events::{self, Event, Source};
 use crate::ffi::{
-    self, CompositorTable, HmdVector2, OverlayTable, SystemTable, Texture, TrackedDevicePose,
-    VREvent,
+    self, CompositorTable, HmdVector2, OverlayTable, SystemTable, Texture, VREvent,
 };
 use crate::loader::{self, Api};
 use crate::matrix::Mat34;
@@ -67,13 +66,6 @@ pub fn is_steamvr_running() -> Result<bool> {
             description: api.init_error_text(code),
         }),
     }
-}
-
-/// Controller role for [`Vr::controller_index`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControllerRole {
-    LeftHand,
-    RightHand,
 }
 
 /// `EDeviceActivityLevel`.
@@ -543,43 +535,6 @@ impl Vr {
     /// The HMD is being worn: activity level `k_EDeviceActivityLevel_UserInteraction` (SPEC §4.1).
     pub fn hmd_worn(&self) -> bool {
         self.activity_level(HMD_INDEX) == ActivityLevel::UserInteraction
-    }
-
-    /// `IVRSystem::GetTrackedDeviceIndexForControllerRole`; `None` if no device has the role.
-    pub fn controller_index(&self, role: ControllerRole) -> Option<u32> {
-        let raw = match role {
-            ControllerRole::LeftHand => ffi::TRACKED_CONTROLLER_ROLE_LEFT_HAND,
-            ControllerRole::RightHand => ffi::TRACKED_CONTROLLER_ROLE_RIGHT_HAND,
-        };
-        // SAFETY: plain value argument.
-        let index = unsafe { (self.sys().GetTrackedDeviceIndexForControllerRole)(raw) };
-        (index < ffi::K_UN_MAX_TRACKED_DEVICE_COUNT).then_some(index)
-    }
-
-    /// `IVRSystem::IsTrackedDeviceConnected`.
-    pub fn is_device_connected(&self, device: u32) -> bool {
-        // SAFETY: plain value argument.
-        unsafe { (self.sys().IsTrackedDeviceConnected)(device) }
-    }
-
-    /// Current device-to-standing-space transform of `device`, or `None` if the index is out of
-    /// range, the device is disconnected or its pose is invalid.
-    pub fn device_pose(&self, device: u32) -> Option<Mat34> {
-        if device >= ffi::K_UN_MAX_TRACKED_DEVICE_COUNT {
-            return None;
-        }
-        let mut poses = [TrackedDevicePose::ZERO; ffi::K_UN_MAX_TRACKED_DEVICE_COUNT as usize];
-        // SAFETY: the array holds at least `device + 1` poses.
-        unsafe {
-            (self.sys().GetDeviceToAbsoluteTrackingPose)(
-                ffi::TRACKING_UNIVERSE_STANDING,
-                0.0,
-                poses.as_mut_ptr(),
-                device + 1,
-            )
-        };
-        let pose = &poses[device as usize];
-        (pose.bPoseIsValid && pose.bDeviceIsConnected).then_some(pose.mDeviceToAbsoluteTracking)
     }
 
     // ---- Events ----

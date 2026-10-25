@@ -44,13 +44,6 @@ pub const VR_OVERLAY_ERROR_THUMBNAIL_CANT_BE_DESTROYED: i32 = 21;
 pub const TEXTURE_TYPE_VULKAN: i32 = 2;
 pub const COLOR_SPACE_GAMMA: i32 = 1;
 
-// ETrackingUniverseOrigin
-pub const TRACKING_UNIVERSE_STANDING: i32 = 1;
-
-// ETrackedControllerRole
-pub const TRACKED_CONTROLLER_ROLE_LEFT_HAND: i32 = 1;
-pub const TRACKED_CONTROLLER_ROLE_RIGHT_HAND: i32 = 2;
-
 // EDeviceActivityLevel
 pub const DEVICE_ACTIVITY_LEVEL_UNKNOWN: i32 = -1;
 pub const DEVICE_ACTIVITY_LEVEL_IDLE: i32 = 0;
@@ -76,9 +69,6 @@ pub const VR_MOUSE_BUTTON_RIGHT: u32 = 2;
 pub const VR_MOUSE_BUTTON_MIDDLE: u32 = 4;
 
 // EVREventType (subset)
-pub const VR_EVENT_TRACKED_DEVICE_ACTIVATED: u32 = 100;
-pub const VR_EVENT_TRACKED_DEVICE_DEACTIVATED: u32 = 101;
-pub const VR_EVENT_TRACKED_DEVICE_ROLE_CHANGED: u32 = 108;
 pub const VR_EVENT_MOUSE_MOVE: u32 = 300;
 pub const VR_EVENT_MOUSE_BUTTON_DOWN: u32 = 301;
 pub const VR_EVENT_MOUSE_BUTTON_UP: u32 = 302;
@@ -103,36 +93,6 @@ pub struct HmdMatrix34 {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct HmdVector2 {
     pub v: [f32; 2],
-}
-
-/// `HmdVector3_t`
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct HmdVector3 {
-    pub v: [f32; 3],
-}
-
-/// `TrackedDevicePose_t`
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct TrackedDevicePose {
-    pub mDeviceToAbsoluteTracking: HmdMatrix34,
-    pub vVelocity: HmdVector3,
-    pub vAngularVelocity: HmdVector3,
-    pub eTrackingResult: i32,
-    pub bPoseIsValid: bool,
-    pub bDeviceIsConnected: bool,
-}
-
-impl TrackedDevicePose {
-    pub const ZERO: Self = Self {
-        mDeviceToAbsoluteTracking: HmdMatrix34 { m: [[0.0; 4]; 3] },
-        vVelocity: HmdVector3 { v: [0.0; 3] },
-        vAngularVelocity: HmdVector3 { v: [0.0; 3] },
-        eTrackingResult: 0,
-        bPoseIsValid: false,
-        bDeviceIsConnected: false,
-    };
 }
 
 /// `Texture_t`
@@ -253,21 +213,16 @@ fn_table! {
         GetOutputDevice: unsafe extern "C" fn(pn_device: *mut u64, texture_type: i32, instance: *mut c_void),
         IsDisplayOnDesktop: Unused,
         SetDisplayVisibility: Unused,
-        GetDeviceToAbsoluteTrackingPose: unsafe extern "C" fn(
-            origin: i32,
-            predicted_seconds: f32,
-            poses: *mut TrackedDevicePose,
-            count: u32,
-        ),
+        GetDeviceToAbsoluteTrackingPose: Unused,
         GetSeatedZeroPoseToStandingAbsoluteTrackingPose: Unused,
         GetRawZeroPoseToStandingAbsoluteTrackingPose: Unused,
         GetSortedTrackedDeviceIndicesOfClass: Unused,
         GetTrackedDeviceActivityLevel: unsafe extern "C" fn(device: TrackedDeviceIndex) -> i32,
         ApplyTransform: Unused,
-        GetTrackedDeviceIndexForControllerRole: unsafe extern "C" fn(role: i32) -> TrackedDeviceIndex,
+        GetTrackedDeviceIndexForControllerRole: Unused,
         GetControllerRoleForTrackedDeviceIndex: Unused,
         GetTrackedDeviceClass: Unused,
-        IsTrackedDeviceConnected: unsafe extern "C" fn(device: TrackedDeviceIndex) -> bool,
+        IsTrackedDeviceConnected: Unused,
         GetBoolTrackedDeviceProperty: Unused,
         GetFloatTrackedDeviceProperty: Unused,
         GetInt32TrackedDeviceProperty: Unused,
@@ -526,8 +481,6 @@ mod tests {
         assert_eq!(size_of::<VREvent>(), 60);
         assert_eq!(offset_of!(VREvent, data), 12);
         assert_eq!(size_of::<HmdMatrix34>(), 48);
-        assert_eq!(size_of::<TrackedDevicePose>(), 80);
-        assert_eq!(offset_of!(TrackedDevicePose, bPoseIsValid), 76);
         assert_eq!(size_of::<Texture>(), 16);
         assert_eq!(size_of::<VRVulkanTextureData>(), 60 + 4);
         assert_eq!(offset_of!(VRVulkanTextureData, m_nQueueFamilyIndex), 40);
@@ -554,18 +507,6 @@ mod tests {
             ),
             ("EColorSpace_ColorSpace_Gamma", COLOR_SPACE_GAMMA as i64),
             (
-                "ETrackingUniverseOrigin_TrackingUniverseStanding",
-                TRACKING_UNIVERSE_STANDING as i64,
-            ),
-            (
-                "ETrackedControllerRole_TrackedControllerRole_LeftHand",
-                TRACKED_CONTROLLER_ROLE_LEFT_HAND as i64,
-            ),
-            (
-                "ETrackedControllerRole_TrackedControllerRole_RightHand",
-                TRACKED_CONTROLLER_ROLE_RIGHT_HAND as i64,
-            ),
-            (
                 "EDeviceActivityLevel_k_EDeviceActivityLevel_UserInteraction",
                 DEVICE_ACTIVITY_LEVEL_USER_INTERACTION as i64,
             ),
@@ -588,18 +529,6 @@ mod tests {
             (
                 "EVRMouseButton_VRMouseButton_Left",
                 VR_MOUSE_BUTTON_LEFT as i64,
-            ),
-            (
-                "EVREventType_VREvent_TrackedDeviceActivated",
-                VR_EVENT_TRACKED_DEVICE_ACTIVATED as i64,
-            ),
-            (
-                "EVREventType_VREvent_TrackedDeviceDeactivated",
-                VR_EVENT_TRACKED_DEVICE_DEACTIVATED as i64,
-            ),
-            (
-                "EVREventType_VREvent_TrackedDeviceRoleChanged",
-                VR_EVENT_TRACKED_DEVICE_ROLE_CHANGED as i64,
             ),
             ("EVREventType_VREvent_MouseMove", VR_EVENT_MOUSE_MOVE as i64),
             (

@@ -4,7 +4,7 @@
 //! thread from [`crate::analysis`], and this one, which owns every OpenVR and
 //! Vulkan object (update checks add a short-lived `curl` thread, §7.1). The main
 //! loop blocks in one `poll()` whose timeout is the nearest deadline (SteamVR
-//! retry, config watch, capture status, controller re-resolve, HUD animation
+//! retry, config watch, capture status, HUD animation
 //! frame, update schedule) and is woken early by signals, by the analysis thread
 //! or by a finished update check. Nothing is rendered unless an overlay is
 //! visible and its renderer reports changed pixels.
@@ -17,22 +17,21 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use fvp_audio::{Capture, CaptureStatus, MicMode, Tone, CAPTURE_NODE_NAME};
-use fvp_config::{Config, Placement, Watcher};
+use fvp_audio::{Capture, CaptureStatus, Tone, CAPTURE_NODE_NAME};
+use fvp_config::{Config, Watcher};
 use fvp_openvr::{
-    cross, dot, is_steamvr_running, normalize, sub, ControllerRole, Event, FrameRef, InputMethod,
-    Mat34, MouseButton, OverlayFlag, OverlayHandle, TextureSubmitter, Vr, HMD_INDEX,
+    is_steamvr_running, Event, FrameRef, InputMethod, Mat34, MouseButton, OverlayFlag, OverlayHandle,
+    TextureSubmitter, Vr, HMD_INDEX,
 };
 use fvp_pitch::{Class, PitchState, ResonanceState};
 use fvp_ui::{
-    hud_overlay_width_m, vocal_rest_toast, Action, CalibStatus, CalibWhich, Hud, HudState, HudView,
-    LiveInfo, ResonanceLive, ResonanceView, SettingsPanel, SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
-    STRINGS,
+    hud_overlay_width_m, vocal_rest_toast, Action, Hud, HudState, HudView, LiveInfo, ResonanceLive,
+    ResonanceView, SettingsPanel, SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
 };
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
-use crate::analysis::{self, Analysis, CalibUpdate, Control};
+use crate::analysis::{self, Analysis, Control};
 use crate::{autostart, exit, instance, signals, update, VERSION_LINE};
 
 /// Overlay key of the HUD (SPEC §4.1).
@@ -52,8 +51,6 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const CONFIG_INTERVAL: Duration = Duration::from_millis(500);
 /// Capture status (= mute) poll cadence.
 const STATUS_INTERVAL: Duration = Duration::from_millis(200);
-/// Controller re-resolve cadence (SPEC §4.1: every 1 s, plus device events).
-const CONTROLLER_INTERVAL: Duration = Duration::from_secs(1);
 /// HUD frame cadence while a colour transition runs.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(16);
 /// `no_mic` after this long without buffers (SPEC §4.1).
@@ -67,18 +64,8 @@ const RING_SECONDS: usize = 2;
 /// Alpha changes smaller than this are not sent to the runtime.
 const ALPHA_STEP: f32 = 0.01;
 
-/// `head` placement offset (SPEC §4.1), before the config nudges.
+/// HUD offset relative to the HMD (SPEC §4.1), before the config nudges.
 const HEAD_OFFSET: [f32; 3] = [-0.12, -0.10, -0.6];
-/// Wrist placement offset in controller space: just back from the grip, above the top face.
-const WRIST_ORIGIN: [f32; 3] = [0.0, -0.04, -0.03];
-/// The panel faces up from the back of the wrist: its normal is the controller's −Z.
-const WRIST_NORMAL: [f32; 3] = [0.0, 0.0, -1.0];
-/// Text-up direction on the wrist panel: along the handle, toward the fingers.
-const WRIST_UP: [f32; 3] = [0.0, 1.0, 0.0];
-/// Alpha starts fading here (angle between panel normal and the HMD direction).
-const FADE_START_DEG: f32 = 60.0;
-/// …and reaches 0 here (SPEC §4.1: beyond 75°).
-const FADE_END_DEG: f32 = 75.0;
 
 /// Runs normal mode until a signal, a SteamVR quit or a Quit action ends it.
 pub fn run() -> Result<u8, Box<dyn Error>> {
@@ -99,8 +86,8 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
 
     let (producer, consumer) =
         rtrb::RingBuffer::new(fvp_audio::SAMPLE_RATE_HZ as usize * RING_SECONDS);
-    let capture = Capture::start(mic_mode(cfg.audio.mic_mode), producer);
-    log::debug!("capture stream {CAPTURE_NODE_NAME} requested in {:?}", cfg.audio.mic_mode);
+    let capture = Capture::start(producer);
+    log::debug!("capture stream {CAPTURE_NODE_NAME} requested");
     let muted = capture.status().muted;
     let (analysis, wake_rx) = Analysis::spawn(consumer, Control::from_config(&cfg, muted, false))?;
 
@@ -124,12 +111,8 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
         state: HudState::NoVoice,
         f0_hz: None,
         resonance: None,
-        calibration: None,
-        calib_relaxed: CalibStatus::NotRecorded,
-        calib_target: CalibStatus::NotRecorded,
+        resonance_hz: None,
         toast: None,
-        controller: None,
-        controller_at: Instant::now(),
         tone: ToneState::Idle,
         autostart: autostart::Autostart::new(),
         autostart_enabled: false,
@@ -139,18 +122,9 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
     app.run_loop(&signal_handles)
 }
 
-fn mic_mode(mode: fvp_config::MicMode) -> MicMode {
-    match mode {
-        fvp_config::MicMode::Bypass => MicMode::Bypass,
-        fvp_config::MicMode::Processed => MicMode::Processed,
-    }
-}
-
 /// The HUD transform/properties last sent to the runtime.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Applied {
-    placement: Placement,
-    device: u32,
     nudge: [f32; 3],
     size_m: f32,
     alpha: f32,
@@ -201,14 +175,9 @@ struct App {
     f0_hz: Option<f32>,
     /// Latest resonance state published by the analysis thread (§5.1).
     resonance: Option<ResonanceState>,
-    /// Calibration recording asked for and not yet finished.
-    calibration: Option<CalibWhich>,
-    calib_relaxed: CalibStatus,
-    calib_target: CalibStatus,
+    /// Latest smoothed resonance reading in Hz (§5.1), shown on the resonance page.
+    resonance_hz: Option<f32>,
     toast: Option<(String, Instant)>,
-    /// Wrist controller resolved for the current placement.
-    controller: Option<(ControllerRole, u32)>,
-    controller_at: Instant,
     tone: ToneState,
     autostart: autostart::Autostart,
     autostart_enabled: bool,
@@ -258,16 +227,13 @@ impl App {
                 self.play_tone();
             }
             self.resonance = snapshot.resonance;
-            if let Some(update) = snapshot.calib {
-                self.on_calib(update);
-            }
-            self.guard_calibration(now);
+            self.resonance_hz = snapshot.resonance_hz;
 
             if self.session.is_none() && now >= self.retry_at {
                 self.connect(now);
             }
             if self.session.is_some() {
-                self.pump_events(now);
+                self.pump_events();
                 self.update_state(now, snapshot.state);
                 self.drive_hud(now);
                 self.drive_dashboard();
@@ -308,7 +274,6 @@ impl App {
         match &self.session {
             None => deadline.min(self.retry_at),
             Some(session) => {
-                deadline = deadline.min(self.controller_at);
                 if self.hud.animating() {
                     deadline = deadline.min(Instant::now() + ANIMATION_INTERVAL);
                 }
@@ -349,13 +314,6 @@ impl App {
 
     /// Applies the current configuration to the subsystems that cache it.
     fn apply_config(&mut self) {
-        self.capture.set_mode(mic_mode(self.cfg.audio.mic_mode));
-        // SPEC §5.1: a calibration needs the indicator on and the bypass path.
-        if self.calibration.is_some()
-            && (!self.cfg.resonance.enabled || self.active_mic_mode() != MicMode::Bypass)
-        {
-            self.abort_calibration();
-        }
         self.sync_paused();
         self.refresh_control();
         self.sync_tone();
@@ -377,8 +335,7 @@ impl App {
             .is_some_and(|session| session.shown || session.dashboard_active);
         !(showing
             || self.cfg.vocal_rest.minutes > 0
-            || self.cfg.resonance.enabled
-            || self.calibration.is_some())
+            || self.cfg.resonance.enabled)
     }
 
     /// Pushes the pause state to the analysis thread if it changed.
@@ -443,13 +400,6 @@ impl App {
             .is_some_and(|since| now.saturating_duration_since(since) >= NO_MIC_AFTER)
     }
 
-    /// Active (not requested) mic mode; before the first status poll, assume the configured one.
-    fn active_mic_mode(&self) -> MicMode {
-        self.status
-            .as_ref()
-            .map_or_else(|| mic_mode(self.cfg.audio.mic_mode), |status| status.active)
-    }
-
     /// Maps capture state and the newest pitch state onto the HUD state (SPEC §4.1).
     fn update_state(&mut self, now: Instant, pitch: Option<PitchState>) {
         let no_mic = self.no_mic(now);
@@ -462,7 +412,9 @@ impl App {
                 Some(pitch) => (
                     match pitch.class {
                         Class::InRange => HudState::InRange,
-                        Class::OutOfRange => HudState::OutOfRange,
+                        Class::OutOfRange => {
+                            out_of_range_state(pitch.f0_hz, self.cfg.band(), self.cfg.target.near_hz, self.state)
+                        }
                         Class::NoVoice => HudState::NoVoice,
                     },
                     pitch.f0_hz,
@@ -478,113 +430,7 @@ impl App {
 
     /// Indicator content for the HUD and the panel, or `None` while it is off.
     fn resonance_view(&self) -> Option<ResonanceView> {
-        resonance_view(
-            self.cfg.resonance.enabled,
-            self.active_mic_mode(),
-            self.cfg.resonance.relaxed_df_hz,
-            self.cfg.resonance.target_df_hz,
-            self.resonance,
-        )
-    }
-
-    fn set_calib_status(&mut self, which: CalibWhich, status: CalibStatus) {
-        match which {
-            CalibWhich::Relaxed => self.calib_relaxed = status,
-            CalibWhich::Target => self.calib_target = status,
-        }
-        self.panel.invalidate();
-    }
-
-    /// Begins a 10 s calibration recording (§5.1).
-    fn start_calibration(&mut self, which: CalibWhich) {
-        if self.calibration.is_some() {
-            log::debug!("a calibration is already recording");
-            return;
-        }
-        if !self.cfg.resonance.enabled {
-            log::debug!("resonance is off; calibration not started");
-            return;
-        }
-        if self.resonance_view() == Some(ResonanceView::NeedsBypass) {
-            log::warn!("resonance needs the bypass mic mode; calibration not started");
-            return;
-        }
-        if self.muted {
-            self.set_calib_status(which, CalibStatus::Failed(STRINGS.state_muted.to_owned()));
-            return;
-        }
-        if self.no_mic(Instant::now()) {
-            self.set_calib_status(which, CalibStatus::Failed(STRINGS.state_no_mic.to_owned()));
-            return;
-        }
-        self.calibration = Some(which);
-        self.set_calib_status(which, CalibStatus::Recording { progress: 0.0 });
-        self.analysis.start_calibration(which);
-        self.sync_paused();
-        log::info!("recording the {which:?} resonance calibration");
-    }
-
-    /// Drops a running recording without a message.
-    fn abort_calibration(&mut self) {
-        if self.calibration.take().is_some() {
-            log::info!("resonance calibration aborted");
-            self.analysis.abort_calibration();
-            self.calib_relaxed = CalibStatus::NotRecorded;
-            self.calib_target = CalibStatus::NotRecorded;
-            self.panel.invalidate();
-            self.sync_paused();
-        }
-    }
-
-    /// Drops a running recording and shows `message`.
-    fn fail_calibration(&mut self, which: CalibWhich, message: String) {
-        log::warn!("resonance calibration stopped: {message}");
-        self.analysis.fail_calibration(message.clone());
-        self.calibration = None;
-        self.set_calib_status(which, CalibStatus::Failed(message));
-        self.sync_paused();
-    }
-
-    /// Stops a recording that became impossible since it started (§5.1).
-    fn guard_calibration(&mut self, now: Instant) {
-        let Some(which) = self.calibration else {
-            return;
-        };
-        if self.active_mic_mode() != MicMode::Bypass {
-            self.abort_calibration();
-        } else if self.muted {
-            self.fail_calibration(which, STRINGS.state_muted.to_owned());
-        } else if self.no_mic(now) {
-            self.fail_calibration(which, STRINGS.state_no_mic.to_owned());
-        }
-    }
-
-    /// Progress and results reported by the analysis thread.
-    fn on_calib(&mut self, update: CalibUpdate) {
-        match update {
-            CalibUpdate::Progress { which, progress } => {
-                // Ignore progress of a recording this loop already dropped.
-                if self.calibration == Some(which) {
-                    self.set_calib_status(which, CalibStatus::Recording { progress });
-                }
-            }
-            CalibUpdate::Done { which, df_hz } => {
-                self.calibration = None;
-                self.set_calib_status(which, CalibStatus::Done { df_hz });
-                apply_calibration(&mut self.cfg, which, df_hz);
-                if let Err(e) = self.watcher.save(&self.cfg) {
-                    log::warn!("cannot save the calibration: {e}");
-                }
-                self.apply_config();
-                log::info!("resonance calibration {which:?}: {df_hz:.0} Hz");
-            }
-            CalibUpdate::Failed { which, message } => {
-                self.calibration = None;
-                self.set_calib_status(which, CalibStatus::Failed(message.clone()));
-                self.sync_paused();
-                log::warn!("resonance calibration {which:?} failed: {message}");
-            }
-        }
+        resonance_view(self.cfg.resonance.enabled, self.resonance)
     }
 
     // ---- Reminder tone ------------------------------------------------------------------
@@ -676,8 +522,6 @@ impl App {
                 // New overlays are blank: force both renderers to produce a first frame.
                 self.hud = Hud::new();
                 self.panel.invalidate();
-                self.controller_at = Instant::now();
-                self.resolve_controller(Instant::now());
             }
             Err(e) => log::warn!("cannot create the overlays ({e}); retrying in 3 s"),
         }
@@ -731,11 +575,10 @@ impl App {
     }
 
     /// Polls OpenVR events and maps them onto the overlays and the settings panel.
-    fn pump_events(&mut self, now: Instant) {
+    fn pump_events(&mut self) {
         let mut events = Vec::new();
         let mut actions = Vec::new();
         let mut restart = false;
-        let mut resolve = false;
         {
             let Some(session) = self.session.as_mut() else {
                 return;
@@ -775,15 +618,9 @@ impl App {
                         self.panel.pointer_leave();
                         session.dashboard_active = false;
                     }
-                    Event::DeviceConnected(_)
-                    | Event::DeviceDisconnected(_)
-                    | Event::DeviceRoleChanged(_) => resolve = true,
                     _ => {}
                 }
             }
-        }
-        if resolve {
-            self.resolve_controller(now);
         }
         if restart {
             log::info!("SteamVR asked the overlays to quit; returning to the retry state");
@@ -815,61 +652,20 @@ impl App {
                 }
                 self.panel.invalidate();
             }
-            Action::StartCalibration(which) => self.start_calibration(which),
             Action::CheckUpdates => self.updater.check_now(),
             Action::StartUpdate(version) => self.updater.start_update(&version, Instant::now()),
             Action::Quit => self.quit = true,
         }
     }
 
-    /// Resolves the wrist controller for the configured placement (SPEC §4.1).
-    fn resolve_controller(&mut self, now: Instant) {
-        self.controller_at = now + CONTROLLER_INTERVAL;
-        let role = match self.cfg.hud.placement {
-            Placement::Head => None,
-            Placement::LeftWrist => Some(ControllerRole::LeftHand),
-            Placement::RightWrist => Some(ControllerRole::RightHand),
-        };
-        let index = match (&self.session, role) {
-            (Some(session), Some(role)) => session
-                .vr
-                .controller_index(role)
-                .filter(|&device| session.vr.is_device_connected(device)),
-            _ => None,
-        };
-        let resolved = role.zip(index);
-        if resolved != self.controller {
-            match resolved {
-                Some((_, device)) => log::info!("HUD follows controller device {device}"),
-                None => log::debug!("no controller for the wrist placement"),
-            }
-            self.controller = resolved;
-        }
-    }
-
     // ---- Rendering ----------------------------------------------------------------------
 
     fn drive_hud(&mut self, now: Instant) {
-        let placement = self.cfg.hud.placement;
         let resonance = self.resonance_view();
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        let device = match placement {
-            Placement::Head => HMD_INDEX,
-            _ => match self.controller {
-                Some((role, device))
-                    if (role == ControllerRole::LeftHand)
-                        == (placement == Placement::LeftWrist) =>
-                {
-                    device
-                }
-                _ => {
-                    set_hud_shown(session, false);
-                    return;
-                }
-            },
-        };
+        let device = HMD_INDEX;
         let visible = self.cfg.hud.enabled && session.vr.hmd_worn();
         set_hud_shown(session, visible);
         if !visible {
@@ -881,23 +677,15 @@ impl App {
             self.cfg.hud.nudge_y_m,
             self.cfg.hud.nudge_z_m,
         ];
-        let mut alpha = self.cfg.hud.opacity;
-        if placement != Placement::Head {
-            alpha *= wrist_fade(&session.vr, device);
-        }
+        let alpha = self.cfg.hud.opacity;
         let size_m = self.cfg.hud.size_m;
-        let placed = session
-            .applied
-            .is_none_or(|old| (old.placement, old.device, old.nudge, old.size_m) != (placement, device, nudge, size_m));
+        let placed = session.applied.is_none_or(|old| (old.nudge, old.size_m) != (nudge, size_m));
         if placed {
-            let transform = match placement {
-                Placement::Head => Mat34::translation(
-                    HEAD_OFFSET[0] + nudge[0],
-                    HEAD_OFFSET[1] + nudge[1],
-                    HEAD_OFFSET[2] + nudge[2],
-                ),
-                _ => wrist_transform(nudge),
-            };
+            let transform = Mat34::translation(
+                HEAD_OFFSET[0] + nudge[0],
+                HEAD_OFFSET[1] + nudge[1],
+                HEAD_OFFSET[2] + nudge[2],
+            );
             if let Err(e) =
                 session
                     .vr
@@ -909,15 +697,13 @@ impl App {
                 log::warn!("HUD width: {e}");
             }
             session.applied = Some(Applied {
-                placement,
-                device,
                 nudge,
                 size_m,
                 // NaN so that the first alpha update is always sent.
                 alpha: f32::NAN,
             });
         }
-        // Throttle alpha changes so a wrist swing does not spam the runtime.
+        // Only send alpha changes that are visible.
         let sent_alpha = session.applied.map_or(f32::NAN, |old| old.alpha);
         if (sent_alpha - alpha).abs() >= ALPHA_STEP || sent_alpha.is_nan() {
             if let Err(e) = session.vr.set_alpha(session.hud, alpha) {
@@ -961,8 +747,7 @@ impl App {
     fn drive_dashboard(&mut self) {
         let resonance = ResonanceLive {
             position: self.resonance_view(),
-            relaxed: self.calib_relaxed.clone(),
-            target: self.calib_target.clone(),
+            reading_hz: self.resonance_hz,
         };
         let Some(session) = self.session.as_mut() else {
             return;
@@ -1027,119 +812,52 @@ fn set_hud_shown(session: &mut Session, shown: bool) {
     }
 }
 
-/// Controller-relative transform of the wrist panel (SPEC §4.1).
-///
-/// The visible face (+Z) points along the controller's −Z axis, "up from the back of the
-/// wrist"; the text runs along the handle (+Y) toward the fingers.
-fn wrist_transform(nudge: [f32; 3]) -> Mat34 {
-    let z = WRIST_NORMAL;
-    let y = WRIST_UP;
-    let x = cross(y, z);
-    Mat34::from_basis(
-        x,
-        y,
-        z,
-        [
-            WRIST_ORIGIN[0] + nudge[0],
-            WRIST_ORIGIN[1] + nudge[1],
-            WRIST_ORIGIN[2] + nudge[2],
-        ],
-    )
-}
-
-/// 1 while the panel faces the HMD, falling to 0 past [`FADE_END_DEG`].
-fn wrist_fade(vr: &Vr, device: u32) -> f32 {
-    let (Some(panel), Some(hmd)) = (vr.device_pose(device), vr.device_pose(HMD_INDEX)) else {
-        return 1.0;
-    };
-    let origin = panel.transform_point(WRIST_ORIGIN);
-    let normal = normalize(panel.transform_vector(WRIST_NORMAL));
-    let towards_hmd = normalize(sub(hmd.origin(), origin));
-    if normal == [0.0; 3] || towards_hmd == [0.0; 3] {
-        return 1.0;
-    }
-    let degrees = dot(normal, towards_hmd)
-        .clamp(-1.0, 1.0)
-        .acos()
-        .to_degrees();
-    fade_for_degrees(degrees)
-}
-
-/// 1 up to [`FADE_START_DEG`], 0 from [`FADE_END_DEG`] on, linear between.
-fn fade_for_degrees(degrees: f32) -> f32 {
-    let t = ((degrees - FADE_START_DEG) / (FADE_END_DEG - FADE_START_DEG)).clamp(0.0, 1.0);
-    1.0 - t
-}
-
-/// §6.3 status line: mode, node recorded from, fallback reason, filter state.
+/// §6.3 status line: source recorded from, mute, current problem.
 fn status_line(status: Option<&CaptureStatus>) -> String {
     let Some(status) = status else {
         return "Microphone: starting".to_owned();
     };
-    let mut parts = Vec::with_capacity(4);
-    parts.push(match (status.active, status.requested) {
-        (MicMode::Bypass, _) => "Bypass".to_owned(),
-        (MicMode::Processed, MicMode::Bypass) => "Processed (bypass unavailable)".to_owned(),
-        (MicMode::Processed, MicMode::Processed) => "Processed".to_owned(),
-    });
     let source = status.source_description.as_deref().unwrap_or("no source");
-    parts.push(match status.active {
-        MicMode::Bypass => format!("recording from {source} (hardware)"),
-        MicMode::Processed => format!("recording from {source}"),
-    });
+    let mut parts = vec![format!("Recording from {source}")];
     if status.muted {
         parts.push("mic muted".to_owned());
     }
-    if let Some(reason) = &status.fallback_reason {
-        parts.push(reason.clone());
+    if let Some(error) = &status.error {
+        parts.push(error.clone());
     }
-    parts.push(
-        match status.filters_active_for_others {
-            Some(true) => "Valve filters active for other apps",
-            Some(false) => "Valve filters inactive for other apps",
-            None => "Valve mic filters not present",
-        }
-        .to_owned(),
-    );
     parts.join(" \u{00b7} ")
 }
 
-/// Indicator content for a configuration, mic mode and tracker state (SPEC §5.1).
-///
-/// Resonance needs the bypass path (Valve's EQ changes the spectrum), both calibration
-/// recordings and a reading; anything missing maps to the corresponding message. The
-/// returned value never influences the tile colour or the reminder.
-fn resonance_view(
-    enabled: bool,
-    active: MicMode,
-    relaxed_df_hz: Option<f32>,
-    target_df_hz: Option<f32>,
-    state: Option<ResonanceState>,
-) -> Option<ResonanceView> {
+/// Colour state for an out-of-range voice (§4.1). Within `near_hz` below the band it is "too
+/// low" (yellow), within `near_hz` above it "too high" (orange), further away "out of range"
+/// (red). The side is decided by the band's geometric centre because the tracker's hysteresis
+/// can report out-of-range a little inside an edge (that counts as near). Without an F0 the
+/// previous out-of-range state is kept.
+fn out_of_range_state(f0_hz: Option<f32>, band: (f32, f32), near_hz: f32, previous: HudState) -> HudState {
+    let (lo, hi) = band;
+    match f0_hz.filter(|f| f.is_finite() && *f > 0.0) {
+        Some(f) if f < (lo * hi).sqrt() => {
+            if lo - f <= near_hz && near_hz > 0.0 { HudState::TooLow } else { HudState::OutOfRange }
+        }
+        Some(f) => {
+            if f - hi <= near_hz && near_hz > 0.0 { HudState::TooHigh } else { HudState::OutOfRange }
+        }
+        None if matches!(previous, HudState::TooLow | HudState::TooHigh) => previous,
+        None => HudState::OutOfRange,
+    }
+}
+
+/// Indicator content for the resonance switch and tracker state (SPEC §5.1); `None` while off.
+/// The returned value never influences the tile colour or the reminder.
+fn resonance_view(enabled: bool, state: Option<ResonanceState>) -> Option<ResonanceView> {
     if !enabled {
         return None;
-    }
-    if active == MicMode::Processed {
-        return Some(ResonanceView::NeedsBypass);
-    }
-    if relaxed_df_hz.is_none() || target_df_hz.is_none() {
-        return Some(ResonanceView::Uncalibrated);
     }
     Some(match state {
         Some(ResonanceState::Position(p)) => ResonanceView::Position(p),
         Some(ResonanceState::TooSimilar) => ResonanceView::TooSimilar,
-        Some(ResonanceState::Uncalibrated) => ResonanceView::Uncalibrated,
         Some(ResonanceState::Gathering) | None => ResonanceView::Gathering,
     })
-}
-
-/// Stores a calibration result in the configuration (§5.1, §6.1).
-fn apply_calibration(cfg: &mut Config, which: CalibWhich, df_hz: f32) {
-    match which {
-        CalibWhich::Relaxed => cfg.resonance.relaxed_df_hz = Some(df_hz),
-        CalibWhich::Target => cfg.resonance.target_df_hz = Some(df_hz),
-    }
-    cfg.clamp();
 }
 
 /// 256 px dashboard icon: the installed hicolor icon, then one next to the executable.
@@ -1172,13 +890,10 @@ fn closes_dashboard(event: &Event, dashboard: OverlayHandle, thumbnail: OverlayH
 mod tests {
     use super::*;
 
-    fn status(active: MicMode, requested: MicMode) -> CaptureStatus {
+    fn status() -> CaptureStatus {
         CaptureStatus {
-            requested,
-            active,
-            source_description: Some("Internal Microphone".into()),
-            fallback_reason: None,
-            filters_active_for_others: Some(false),
+            source_description: Some("Built-in Audio Capture".into()),
+            error: None,
             muted: false,
             healthy: true,
         }
@@ -1197,29 +912,15 @@ mod tests {
     }
 
     #[test]
-    fn status_line_matches_the_spec_example() {
+    fn status_line_reports_source_mute_and_problem() {
+        assert_eq!(status_line(Some(&status())), "Recording from Built-in Audio Capture");
+        let mut troubled = status();
+        troubled.muted = true;
+        troubled.error = Some("PipeWire connection lost".into());
+        troubled.source_description = None;
         assert_eq!(
-            status_line(Some(&status(MicMode::Bypass, MicMode::Bypass))),
-            "Bypass \u{00b7} recording from Internal Microphone (hardware) \u{00b7} \
-             Valve filters inactive for other apps"
-        );
-    }
-
-    #[test]
-    fn status_line_reports_fallback_and_mute() {
-        let mut fallback = status(MicMode::Processed, MicMode::Bypass);
-        fallback.fallback_reason =
-            Some("Bypass unavailable: hardware mic node not found — using processed mic".into());
-        fallback.muted = true;
-        fallback.filters_active_for_others = Some(true);
-        let line = status_line(Some(&fallback));
-        assert!(line.starts_with("Processed (bypass unavailable)"), "{line}");
-        assert!(line.contains("recording from Internal Microphone \u{00b7}"), "{line}");
-        assert!(line.contains("mic muted"), "{line}");
-        assert!(line.contains("using processed mic"), "{line}");
-        assert!(
-            line.ends_with("Valve filters active for other apps"),
-            "{line}"
+            status_line(Some(&troubled)),
+            "Recording from no source \u{00b7} mic muted \u{00b7} PipeWire connection lost"
         );
         assert_eq!(status_line(None), "Microphone: starting");
     }
@@ -1236,20 +937,6 @@ mod tests {
     }
 
     #[test]
-    fn wrist_panel_faces_up_and_is_right_handed() {
-        let transform = wrist_transform([0.0, 0.0, 0.0]);
-        let m = transform.m;
-        let (x, y, z) = ([m[0][0], m[1][0], m[2][0]], [m[0][1], m[1][1], m[2][1]], [
-            m[0][2], m[1][2], m[2][2],
-        ]);
-        assert_eq!(z, WRIST_NORMAL);
-        assert_eq!(y, WRIST_UP);
-        assert_eq!(cross(x, y), z, "not a right-handed basis");
-        assert_eq!(dot(x, x), 1.0);
-        assert_eq!(transform.origin(), WRIST_ORIGIN);
-    }
-
-    #[test]
     fn icon_never_returns_a_missing_path() {
         if let Some(path) = icon_path() {
             assert!(path.is_file(), "{}", path.display());
@@ -1257,82 +944,21 @@ mod tests {
     }
 
     #[test]
-    fn wrist_fade_uses_the_documented_thresholds() {
-        assert_eq!(fade_for_degrees(0.0), 1.0);
-        assert_eq!(fade_for_degrees(FADE_START_DEG), 1.0);
-        assert!((fade_for_degrees(67.5) - 0.5).abs() < 1e-6);
-        assert_eq!(fade_for_degrees(FADE_END_DEG), 0.0);
-        assert_eq!(fade_for_degrees(120.0), 0.0);
-    }
-
-    #[test]
-    fn resonance_view_needs_bypass_both_calibrations_and_a_reading() {
-        let (relaxed, target) = (Some(1000.0f32), Some(1200.0f32));
-        let position = Some(ResonanceState::Position(0.5));
-        assert_eq!(
-            resonance_view(false, MicMode::Bypass, relaxed, target, position),
-            None,
-            "off means nothing on the HUD"
-        );
-        assert_eq!(
-            resonance_view(true, MicMode::Processed, relaxed, target, position),
-            Some(ResonanceView::NeedsBypass),
-            "Valve's EQ changes the spectrum (§5.1)"
-        );
-        assert_eq!(
-            resonance_view(true, MicMode::Bypass, None, target, position),
-            Some(ResonanceView::Uncalibrated)
-        );
-        assert_eq!(
-            resonance_view(true, MicMode::Bypass, relaxed, None, None),
-            Some(ResonanceView::Uncalibrated)
-        );
-        assert_eq!(
-            resonance_view(true, MicMode::Bypass, relaxed, target, None),
-            Some(ResonanceView::Gathering)
-        );
-        assert_eq!(
-            resonance_view(
-                true,
-                MicMode::Bypass,
-                relaxed,
-                target,
-                Some(ResonanceState::TooSimilar)
-            ),
-            Some(ResonanceView::TooSimilar)
-        );
-        assert_eq!(
-            resonance_view(true, MicMode::Bypass, relaxed, target, position),
-            Some(ResonanceView::Position(0.5))
-        );
-    }
-
-    #[test]
-    fn calibration_result_survives_a_config_round_trip() {
-        let dir = std::env::temp_dir().join(format!("fvp-calib-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-
-        let mut cfg = Config::default();
-        apply_calibration(&mut cfg, CalibWhich::Relaxed, 1012.0);
-        apply_calibration(&mut cfg, CalibWhich::Target, 1187.5);
-        fvp_config::save(&cfg, &path).unwrap();
-
-        let reloaded = fvp_config::load_or_init(&path);
-        assert_eq!(reloaded.resonance.relaxed_df_hz, Some(1012.0));
-        assert_eq!(reloaded.resonance.target_df_hz, Some(1187.5));
-        assert_eq!(
-            resonance_view(
-                true,
-                MicMode::Bypass,
-                reloaded.resonance.relaxed_df_hz,
-                reloaded.resonance.target_df_hz,
-                Some(ResonanceState::Position(1.0))
-            ),
-            Some(ResonanceView::Position(1.0))
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn out_of_range_colour_follows_side_and_near_zone() {
+        let band = (165.0, 255.0);
+        let s = |f, near| out_of_range_state(f, band, near, HudState::InRange);
+        assert_eq!(s(Some(160.0), 10.0), HudState::TooLow);
+        assert_eq!(s(Some(155.0), 10.0), HudState::TooLow, "edge of the zone is still near");
+        assert_eq!(s(Some(154.0), 10.0), HudState::OutOfRange);
+        assert_eq!(s(Some(262.0), 10.0), HudState::TooHigh);
+        assert_eq!(s(Some(266.0), 10.0), HudState::OutOfRange);
+        // Hysteresis can report out-of-range just inside an edge: near, on that side.
+        assert_eq!(s(Some(166.0), 10.0), HudState::TooLow);
+        assert_eq!(s(Some(254.0), 10.0), HudState::TooHigh);
+        // Zone off: everything outside is red.
+        assert_eq!(s(Some(164.0), 0.0), HudState::OutOfRange);
+        // No F0: keep the previous state.
+        assert_eq!(out_of_range_state(None, band, 10.0, HudState::TooHigh), HudState::TooHigh);
+        assert_eq!(out_of_range_state(None, band, 10.0, HudState::InRange), HudState::OutOfRange);
     }
 }

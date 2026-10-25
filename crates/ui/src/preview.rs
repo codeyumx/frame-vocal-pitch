@@ -6,19 +6,20 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use fvp_config::{Config, DisplayMode, MicMode, Preset};
+use fvp_config::{Config, DisplayMode, Preset};
 use tiny_skia::{IntSize, Pixmap};
 
 use crate::hud::{Hud, HudState, HudView, ResonanceView};
 use crate::settings::{
-    CalibStatus, Card, LiveInfo, Page, ResonanceLive, SettingsPanel, UpdateLive, UpdateStatus,
+    Card, LiveInfo, Page, ResonanceLive, SettingsPanel, UpdateLive, UpdateStatus,
 };
-use crate::strings::STRINGS;
 use crate::{icon, Frame};
 
 fn state_name(s: HudState) -> &'static str {
     match s {
         HudState::InRange => "in_range",
+        HudState::TooLow => "too_low",
+        HudState::TooHigh => "too_high",
         HudState::OutOfRange => "out_of_range",
         HudState::NoVoice => "no_voice",
         HudState::Muted => "muted",
@@ -26,8 +27,10 @@ fn state_name(s: HudState) -> &'static str {
     }
 }
 
-const STATES: [HudState; 5] = [
+const STATES: [HudState; 7] = [
     HudState::InRange,
+    HudState::TooLow,
+    HudState::TooHigh,
     HudState::OutOfRange,
     HudState::NoVoice,
     HudState::Muted,
@@ -70,7 +73,9 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
                 state,
                 f0_hz: match state {
                     HudState::InRange => Some(182.0),
-                    HudState::OutOfRange => Some(128.0),
+                    HudState::TooLow => Some(128.0),
+                    HudState::TooHigh => Some(262.0),
+                    HudState::OutOfRange => Some(320.0),
                     _ => None,
                 },
                 band: cfg.band(),
@@ -99,15 +104,13 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     };
     emit("hud-detailed-toast.png".into(), Hud::new().render(&toast_view, Instant::now()))?;
 
-    let resonance_views: [(&str, HudState, ResonanceView); 8] = [
+    let resonance_views: [(&str, HudState, ResonanceView); 6] = [
         ("near-target", HudState::InRange, ResonanceView::Position(0.85)),
-        ("between", HudState::OutOfRange, ResonanceView::Position(0.45)),
+        ("between", HudState::TooLow, ResonanceView::Position(0.45)),
         ("beyond-clamped", HudState::InRange, ResonanceView::Position(3.0)),
         ("below-clamped", HudState::NoVoice, ResonanceView::Position(-2.0)),
         ("gathering", HudState::InRange, ResonanceView::Gathering),
-        ("uncalibrated", HudState::InRange, ResonanceView::Uncalibrated),
-        ("too-similar", HudState::OutOfRange, ResonanceView::TooSimilar),
-        ("needs-bypass", HudState::Muted, ResonanceView::NeedsBypass),
+        ("too-similar", HudState::TooHigh, ResonanceView::TooSimilar),
     ];
     for (name, state, res) in resonance_views {
         let view = HudView {
@@ -126,9 +129,7 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     let live = LiveInfo {
         f0_hz: Some(182.0),
         state: HudState::InRange,
-        mic_status_line: "Bypass \u{00b7} recording from Internal Microphone (hardware node) \u{00b7} \
-                          Valve mic filters: inactive for other apps"
-            .into(),
+        mic_status_line: "Recording from Built-in Audio Capture".into(),
         autostart: true,
         resonance: ResonanceLive::default(),
         update: UpdateLive {
@@ -143,7 +144,6 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     custom.target.preset = Preset::Custom;
     custom.target.custom_low_hz = 140.0;
     custom.target.custom_high_hz = 210.0;
-    custom.audio.mic_mode = MicMode::Bypass;
     custom.reminder.enabled = true;
     custom.vocal_rest.minutes = 30;
     custom.hud.display = DisplayMode::Detailed;
@@ -152,43 +152,37 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     let fallback = LiveInfo {
         f0_hz: None,
         state: HudState::NoMic,
-        mic_status_line: "Processed (requested: bypass) \u{00b7} Bypass unavailable: hardware mic \
-                          node not found \u{2014} using processed mic \u{00b7} recording from Steam \
-                          Frame Microphone \u{00b7} Valve mic filters: active for other apps"
-            .into(),
+        mic_status_line: "Recording from no source \u{00b7} PipeWire connection lost".into(),
         autostart: false,
         resonance: ResonanceLive::default(),
         update: UpdateLive::default(),
     };
     emit("settings-custom.png".into(), SettingsPanel::new().render(&custom, &fallback))?;
 
-    // Resonance page: off, on while recording, on with a failure and the "too similar" state.
+    // Resonance page: off, on with a reading, and the "too similar" state.
     let mut panel = SettingsPanel::new();
     panel.show(Page::Resonance, None);
     emit("settings-resonance-off.png".into(), panel.render(&cfg, &live))?;
 
     let mut on = cfg.clone();
     on.resonance.enabled = true;
-    on.resonance.relaxed_df_hz = Some(1012.0);
-    let recording = LiveInfo {
+    on.resonance.relaxed_df_hz = 1010.0;
+    let reading = LiveInfo {
         resonance: ResonanceLive {
             position: Some(ResonanceView::Position(0.82)),
-            relaxed: CalibStatus::NotRecorded,
-            target: CalibStatus::Recording { progress: 0.37 },
+            reading_hz: Some(1133.0),
         },
         ..live.clone()
     };
-    emit("settings-resonance-recording.png".into(), panel.render(&on, &recording))?;
+    emit("settings-resonance-reading.png".into(), panel.render(&on, &reading))?;
 
-    let failed = LiveInfo {
-        resonance: ResonanceLive {
-            position: Some(ResonanceView::TooSimilar),
-            relaxed: CalibStatus::Done { df_hz: 1012.0 },
-            target: CalibStatus::Failed(STRINGS.calib_not_enough_speech.into()),
-        },
+    let mut similar_cfg = on.clone();
+    similar_cfg.resonance.target_df_hz = 1030.0;
+    let similar = LiveInfo {
+        resonance: ResonanceLive { position: Some(ResonanceView::TooSimilar), reading_hz: None },
         ..live.clone()
     };
-    emit("settings-resonance-failed.png".into(), panel.render(&on, &failed))?;
+    emit("settings-resonance-similar.png".into(), panel.render(&similar_cfg, &similar))?;
 
     let mut card = SettingsPanel::new();
     card.show(Page::Resonance, Some(Card::Enable));
@@ -196,7 +190,7 @@ pub fn render_all_png(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     card.scroll(-100.0);
     emit("settings-card-enable-scrolled.png".into(), card.render(&cfg, &live))?;
     card.show(Page::Resonance, Some(Card::Info));
-    emit("settings-card-info.png".into(), card.render(&on, &recording))?;
+    emit("settings-card-info.png".into(), card.render(&on, &reading))?;
 
     // Updates page: up to date, a newer release (then armed for confirmation), updating after a
     // manual start, and the two failure lines.

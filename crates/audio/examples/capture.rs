@@ -1,29 +1,20 @@
-//! Manual smoke test for [`fvp_audio::Capture`]: records for 5 s in the mode given on the
-//! command line, printing the status and the input level every 500 ms.
+//! Manual smoke test for [`fvp_audio::Capture`]: records for 5 s, printing the status and the
+//! input level every 500 ms.
 //!
 //! ```text
-//! cargo run -p fvp-audio --example capture -- bypass
-//! cargo run -p fvp-audio --example capture -- processed
+//! cargo run -p fvp-audio --example capture
 //! ```
 
 use std::time::{Duration, Instant};
 
-use fvp_audio::{Capture, CaptureStatus, MicMode};
+use fvp_audio::{Capture, CaptureStatus};
 
 const RUN: Duration = Duration::from_secs(5);
 const REPORT: Duration = Duration::from_millis(500);
 
 fn main() {
-    let mode = match std::env::args().nth(1).as_deref() {
-        Some("bypass") => MicMode::Bypass,
-        Some("processed") => MicMode::Processed,
-        other => {
-            eprintln!("usage: capture <bypass|processed> (got {other:?})");
-            std::process::exit(2);
-        }
-    };
     let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(48_000 * 4);
-    let capture = Capture::start(mode, producer);
+    let capture = Capture::start(producer);
 
     let start = Instant::now();
     let mut reported = start;
@@ -57,18 +48,6 @@ fn main() {
 
 fn format_status(s: &CaptureStatus) -> String {
     let source = s.source_description.as_deref().unwrap_or("-");
-    let fallback = s
-        .fallback_reason
-        .as_deref()
-        .map(|r| format!(" fallback={r:?}"))
-        .unwrap_or_default();
-    let filters = match s.filters_active_for_others {
-        Some(true) => "filters=on",
-        Some(false) => "filters=off",
-        None => "filters=n/a",
-    };
-    format!(
-        "requested={:?} active={:?} source={source:?} {filters} muted={} healthy={}{fallback}",
-        s.requested, s.active, s.muted, s.healthy
-    )
+    let error = s.error.as_deref().map(|r| format!(" error={r:?}")).unwrap_or_default();
+    format!("source={source:?} muted={} healthy={}{error}", s.muted, s.healthy)
 }

@@ -26,7 +26,7 @@ pub use loader::{find_library, library_candidates, DEVICE_LIBRARY_PATH, LIBRARY_
 pub use matrix::{cross, dot, normalize, sub, Mat34, Vec3};
 pub use vk::{FrameRef, TextureSubmitter};
 pub use vr::{
-    is_steamvr_running, ActivityLevel, ControllerRole, InputMethod, OverlayFlag, Vr, HMD_INDEX,
+    is_steamvr_running, ActivityLevel, InputMethod, OverlayFlag, Vr, HMD_INDEX,
     SHUTDOWN_GRACE,
 };
 
