@@ -69,6 +69,37 @@ pub const VOCAL_REST_BUCKETS: usize = 3600;
 /// Minimum interval between vocal-rest toasts.
 pub const VOCAL_REST_REPEAT_S: f64 = 600.0;
 
+/// Resonance (SPEC §5.1): analysis frame length.
+pub const RESONANCE_FRAME_S: f64 = 0.025;
+/// Resonance: only voiced hops with F0 at or below this are analysed.
+pub const RESONANCE_MAX_F0_HZ: f32 = 300.0;
+/// Resonance: pre-emphasis coefficient, `y[n] = x[n] − k·x[n−1]`.
+pub const PRE_EMPHASIS: f32 = 0.97;
+/// Resonance: linear-prediction order.
+pub const LPC_ORDER: usize = 16;
+/// Resonance: band in which LPC resonances count as formants.
+pub const FORMANT_MIN_HZ: f32 = 200.0;
+pub const FORMANT_MAX_HZ: f32 = 4000.0;
+/// Resonance: a formant's bandwidth must be below this.
+pub const FORMANT_MAX_BANDWIDTH_HZ: f32 = 500.0;
+/// Resonance: default median window (`resonance.window_s`) and its limits.
+pub const RESONANCE_WINDOW_S: f32 = 8.0;
+pub const RESONANCE_WINDOW_MIN_S: f32 = 4.0;
+pub const RESONANCE_WINDOW_MAX_S: f32 = 20.0;
+/// Resonance: accepted frames needed in the window before a value is shown.
+pub const RESONANCE_MIN_ACCEPTED_S: f64 = 2.0;
+/// Resonance: interval between recomputations of the window median.
+pub const RESONANCE_MEDIAN_INTERVAL_S: f64 = 0.1;
+/// Resonance: time constant of the displayed-value EMA.
+pub const RESONANCE_SMOOTHING_S: f64 = 1.0;
+/// Resonance calibration: recording length.
+pub const CALIBRATION_S: f64 = 10.0;
+/// Resonance calibration: accepted frames needed for a result.
+pub const CALIBRATION_MIN_ACCEPTED_S: f64 = 3.0;
+/// Resonance calibration: relaxed and target closer than this fraction of
+/// relaxed are "too similar".
+pub const CALIBRATION_MIN_SEPARATION: f32 = 0.05;
+
 /// Slack for comparisons of hop timestamps against durations.
 pub(crate) const TIME_EPS: f64 = 1e-6;
 

@@ -45,6 +45,7 @@ pub struct Config {
     pub reminder: Reminder,
     pub vocal_rest: VocalRest,
     pub audio: Audio,
+    pub resonance: Resonance,
 }
 
 /// `[hud]`
@@ -158,6 +159,40 @@ impl Default for Audio {
             detect_min_hz: 60.0,
             detect_max_hz: 500.0,
             noise_floor_min_dbfs: -60.0,
+        }
+    }
+}
+
+/// `[resonance]` (SPEC §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Resonance {
+    /// Set only after the explanation card was acknowledged.
+    pub enabled: bool,
+    /// Median window for the displayed value, seconds (4–20).
+    #[serde(serialize_with = "ser_f32")]
+    pub window_s: f32,
+    /// Calibrated formant spacing of the relaxed voice, Hz; `None` = not calibrated.
+    #[serde(
+        serialize_with = "ser_opt_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub relaxed_df_hz: Option<f32>,
+    /// Calibrated formant spacing of the target voice, Hz; `None` = not calibrated.
+    #[serde(
+        serialize_with = "ser_opt_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_df_hz: Option<f32>,
+}
+
+impl Default for Resonance {
+    fn default() -> Self {
+        Resonance {
+            enabled: false,
+            window_s: 8.0,
+            relaxed_df_hz: None,
+            target_df_hz: None,
         }
     }
 }
@@ -277,6 +312,8 @@ impl Config {
     /// Pair rules: `detect_min_hz ≤ detect_max_hz − 50` (raises the max, or lowers the min at the
     /// top of the range); custom band inside the detection span with `low ≤ high − 10` (raises the
     /// high, or lowers the low at the top of the span); `vocal_rest.minutes` 1–4 becomes 5.
+    /// A resonance calibration value that is not a finite positive number becomes "not
+    /// calibrated" (`None`).
     pub fn clamp(&mut self) {
         let d = Config::default();
 
@@ -366,6 +403,17 @@ impl Config {
             hi,
             "target.custom_low_hz/custom_high_hz",
         );
+
+        let res = &mut self.resonance;
+        res.window_s = clamp_f(
+            res.window_s,
+            4.0,
+            20.0,
+            d.resonance.window_s,
+            "resonance.window_s",
+        );
+        res.relaxed_df_hz = valid_calibration(res.relaxed_df_hz, "resonance.relaxed_df_hz");
+        res.target_df_hz = valid_calibration(res.target_df_hz, "resonance.target_df_hz");
     }
 }
 
@@ -375,6 +423,16 @@ fn clamp_f(v: f32, lo: f32, hi: f32, default: f32, key: &str) -> f32 {
         log::debug!("config: {key} {v} clamped to {out}");
     }
     out
+}
+
+fn valid_calibration(v: Option<f32>, key: &str) -> Option<f32> {
+    match v {
+        Some(x) if !(x.is_finite() && x > 0.0) => {
+            log::debug!("config: {key} {x} is not a valid calibration; treated as absent");
+            None
+        }
+        v => v,
+    }
 }
 
 /// Makes `low ≤ high − gap`, preferring to raise `high`; at the `top` limit lowers `low` instead.
@@ -396,6 +454,14 @@ fn enforce_gap(low: f32, high: f32, gap: f32, top: f32, key: &str) -> (f32, f32)
 fn ser_f32<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
     let shortest: f64 = v.to_string().parse().unwrap_or(f64::from(*v));
     s.serialize_f64(shortest)
+}
+
+/// [`ser_f32`] for optional values; `None` is skipped by `skip_serializing_if`.
+fn ser_opt_f32<S: Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(x) => ser_f32(x, s),
+        None => s.serialize_none(),
+    }
 }
 
 /// Deserializes a non-negative integer, saturating negative values to 0 and huge ones to
@@ -688,6 +754,15 @@ mod tests {
             (60.0, 500.0)
         );
         assert_eq!(c.audio.noise_floor_min_dbfs, -60.0);
+        assert_eq!(c.resonance, Resonance::default());
+        assert!(!c.resonance.enabled);
+        assert_eq!(c.resonance.window_s, 8.0);
+        assert_eq!(c.resonance.relaxed_df_hz, None);
+        assert_eq!(c.resonance.target_df_hz, None);
+        assert!(
+            !to_toml(&c).contains("_df_hz"),
+            "absent calibration is omitted"
+        );
         assert_eq!(c.band(), (165.0, 255.0));
 
         // Defaults are already within range.
@@ -807,6 +882,30 @@ mod tests {
     }
 
     #[test]
+    fn clamping_resonance() {
+        let c = parse(
+            "[resonance]\nenabled = true\nwindow_s = 1\nrelaxed_df_hz = -3\ntarget_df_hz = nan\n",
+        )
+        .unwrap();
+        assert!(c.resonance.enabled);
+        assert_eq!(c.resonance.window_s, 4.0);
+        assert_eq!(c.resonance.relaxed_df_hz, None);
+        assert_eq!(c.resonance.target_df_hz, None);
+
+        let c = parse("[resonance]\nwindow_s = 60\nrelaxed_df_hz = 1000\n").unwrap();
+        assert_eq!(c.resonance.window_s, 20.0);
+        assert_eq!(c.resonance.relaxed_df_hz, Some(1000.0));
+        assert_eq!(c.resonance.target_df_hz, None);
+        assert_eq!(
+            parse("[resonance]\nwindow_s = nan\n")
+                .unwrap()
+                .resonance
+                .window_s,
+            8.0
+        );
+    }
+
+    #[test]
     fn clamping_custom_band() {
         // Inside the detection span.
         let c = parse("[target]\ncustom_low_hz = 20\ncustom_high_hz = 900\n").unwrap();
@@ -861,6 +960,10 @@ mod tests {
         c.audio.detect_min_hz = 70.0;
         c.audio.detect_max_hz = 450.0;
         c.audio.noise_floor_min_dbfs = -55.0;
+        c.resonance.enabled = true;
+        c.resonance.window_s = 12.5;
+        c.resonance.relaxed_df_hz = Some(1031.25);
+        c.resonance.target_df_hz = Some(1187.4);
 
         let text = to_toml(&c);
         assert!(

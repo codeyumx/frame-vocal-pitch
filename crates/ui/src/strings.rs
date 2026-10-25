@@ -71,6 +71,57 @@ pub struct Strings {
     pub autostart: &'static str,
     pub mic_bypass: &'static str,
     pub mic_processed: &'static str,
+
+    pub tab_general: &'static str,
+    pub tab_resonance: &'static str,
+
+    // Resonance indicator on the HUD (§4.1, §5.1); shown in a narrow column, keep short.
+    pub hud_res_relaxed: &'static str,
+    pub hud_res_target: &'static str,
+    pub hud_res_uncalibrated: &'static str,
+    pub hud_res_too_similar: &'static str,
+    pub hud_res_needs_bypass: &'static str,
+
+    // Resonance page of the settings panel (§4.2, §5.1).
+    pub section_resonance: &'static str,
+    pub res_enabled: &'static str,
+    pub res_intro: &'static str,
+    pub res_how: &'static str,
+    pub res_now: &'static str,
+    pub res_off_hint: &'static str,
+    pub res_gathering: &'static str,
+    pub res_uncalibrated: &'static str,
+    pub res_too_similar: &'static str,
+    pub res_needs_bypass: &'static str,
+    pub res_near_relaxed: &'static str,
+    pub res_between: &'static str,
+    pub res_near_target: &'static str,
+    pub res_beyond_target: &'static str,
+
+    pub section_calibration: &'static str,
+    pub record_relaxed: &'static str,
+    pub record_target: &'static str,
+    pub calib_not_recorded: &'static str,
+    /// Template; `{s}` is replaced by the whole seconds left.
+    pub calib_recording: &'static str,
+    /// Template; `{v}` is replaced by the stored formant spacing in Hz.
+    pub calib_done: &'static str,
+    /// Failure message for a calibration with fewer than 3 s of accepted frames (§5.1).
+    pub calib_not_enough_speech: &'static str,
+    pub calib_hint: &'static str,
+
+    // Explanation card (§5.1 "User guidance"). Paragraphs in display order: `card_what`,
+    // `card_others`, `card_pitch`, `card_turn_off` (emphasised), then `card_cases` as bullets.
+    pub card_title: &'static str,
+    pub card_what: &'static str,
+    pub card_others: &'static str,
+    pub card_pitch: &'static str,
+    pub card_turn_off: &'static str,
+    pub card_cases: [&'static str; 4],
+    pub card_scroll_hint: &'static str,
+    pub card_turn_on: &'static str,
+    pub card_keep_off: &'static str,
+    pub card_close: &'static str,
 }
 
 /// English (required) string table.
@@ -137,6 +188,67 @@ pub const EN: Strings = Strings {
     autostart: "Autostart with SteamVR",
     mic_bypass: "Bypass Valve processing (this app only)",
     mic_processed: "Use processed mic",
+
+    tab_general: "General",
+    tab_resonance: "Resonance (experimental)",
+
+    hud_res_relaxed: "relaxed",
+    hud_res_target: "target",
+    hud_res_uncalibrated: "Calibrate in settings",
+    hud_res_too_similar: "Recordings too similar",
+    hud_res_needs_bypass: "Needs bypass mic mode",
+
+    section_resonance: "Resonance (experimental)",
+    res_enabled: "Indicator",
+    res_intro: "Shows whether your voice is drifting brighter or darker compared with your own two \
+                recordings. It is rough and moves slowly. It appears on the HUD next to the pitch \
+                bar when Display is set to Detailed.",
+    res_how: "How this works",
+    res_now: "Right now",
+    res_off_hint: "Off. Turn the indicator on to record your voice and see where it is.",
+    res_gathering: "Listening\u{2026} keep talking for a few seconds",
+    res_uncalibrated: "Record your relaxed and your target voice to see the indicator",
+    res_too_similar: "These two recordings are too similar to tell apart; the indicator will not \
+                      be useful",
+    res_needs_bypass: "Resonance needs the bypass mic mode",
+    res_near_relaxed: "Brightness: near relaxed",
+    res_between: "Brightness: between",
+    res_near_target: "Brightness: near target",
+    res_beyond_target: "Brightness: beyond target",
+
+    section_calibration: "Calibration",
+    record_relaxed: "Record relaxed voice (10 s)",
+    record_target: "Record target voice (10 s)",
+    calib_not_recorded: "Not recorded yet",
+    calib_recording: "Recording\u{2026} keep talking ({s} s left)",
+    calib_done: "Recorded \u{00b7} {v} Hz",
+    calib_not_enough_speech: "Not enough clear speech \u{2014} try again in a quiet place, speaking \
+                              normally",
+    calib_hint: "Speak normally for the whole 10 seconds, in a quiet place, in the language and \
+                 accent you use in VR. Record again whenever you change language or accent.",
+
+    card_title: "About the resonance indicator (experimental)",
+    card_what: "This is a rough estimate of how bright or dark your voice sounds, compared with \
+                two recordings of your own voice: one relaxed, one in your target voice. It moves \
+                slowly on purpose.",
+    card_others: "It cannot tell you how other people hear your voice. A voice coach or someone \
+                  you trust can.",
+    card_pitch: "Pitch feedback works the same with this on or off.",
+    card_turn_off: "Turn it off if any of these apply, or if it does not match what you hear or \
+                    what people you trust tell you:",
+    card_cases: [
+        "You speak a different language or accent in VR than in your recordings, or you switch \
+         often. Vowels differ between languages and accents, and they move the estimate. Record \
+         again in the language you are using.",
+        "You are whispering, singing or shouting, your voice is very high (above about 300 Hz it \
+         cannot measure), or the room is noisy.",
+        "Your goal is not about how bright or dark your voice sounds.",
+        "Watching it makes you tense or self-conscious.",
+    ],
+    card_scroll_hint: "Scroll for more",
+    card_turn_on: "Turn on",
+    card_keep_off: "Keep off",
+    card_close: "Close",
 };
 
 /// The active string table.

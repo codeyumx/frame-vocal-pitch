@@ -2,8 +2,8 @@
 //!
 //! The texture is [`HUD_WIDTH_PX`] × [`HUD_HEIGHT_PX`]. The state tile ([`HUD_TILE_PX`] square) is
 //! centred in it, so the overlay transform positions the tile itself; the transparent margin below
-//! the tile holds the vocal-rest toast. Size the overlay with [`hud_overlay_width_m`] so the tile
-//! is `hud.size_m` wide.
+//! the tile holds the vocal-rest toast and the margin right of it the resonance labels (§5.1). Size
+//! the overlay with [`hud_overlay_width_m`] so the tile is `hud.size_m` wide.
 
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,9 @@ use crate::Frame;
 
 /// Width and height of the coloured tile in texture pixels.
 pub const HUD_TILE_PX: u32 = 256;
-/// HUD texture width in pixels.
-pub const HUD_WIDTH_PX: u32 = 512;
+/// HUD texture width in pixels; the margins either side of the tile are wide enough for the
+/// resonance label column (§5.1) on the right.
+pub const HUD_WIDTH_PX: u32 = 640;
 /// HUD texture height in pixels.
 pub const HUD_HEIGHT_PX: u32 = 544;
 
@@ -36,6 +37,11 @@ const TILE: R = R::new(
 const TILE_RADIUS: f32 = 44.0;
 const TOAST_TOP: f32 = TILE.y + TILE.h + 10.0;
 const TOAST_MAX_LINES: usize = 3;
+const TOAST_MAX_W: f32 = 2.0 * HUD_TILE_PX as f32 - 52.0;
+/// Left edge and width of the label column in the transparent margin right of the tile.
+const LABEL_X: f32 = TILE.x + TILE.w + 8.0;
+const LABEL_W: f32 = HUD_WIDTH_PX as f32 - 6.0 - LABEL_X;
+const LABEL_BG: Rgba = Rgba::hex(0x141414, 225);
 
 /// What the HUD shows (§4.1 state table).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -72,6 +78,25 @@ impl HudState {
     }
 }
 
+/// Resonance range drawn on the HUD bar (§5.1): positions outside it are pinned to its ends.
+pub const RESONANCE_DISPLAY_RANGE: (f32, f32) = (-0.25, 1.25);
+
+/// Resonance indicator content (§5.1), shown in `detailed` mode only.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ResonanceView {
+    /// Fewer than 2 s of accepted frames in the window: dim bar, no marker.
+    Gathering,
+    /// One or both calibrations missing: dim bar, "Calibrate in settings".
+    Uncalibrated,
+    /// The two calibrations are less than 5 % apart: dim bar, no marker.
+    TooSimilar,
+    /// The active mic mode is processed (§6.3): dim bar, no marker.
+    NeedsBypass,
+    /// Smoothed position p (0 = relaxed, 1 = target), raw; drawn clamped to
+    /// [`RESONANCE_DISPLAY_RANGE`]. Non-finite values are shown like [`ResonanceView::Gathering`].
+    Position(f32),
+}
+
 /// Everything the HUD needs to draw one frame.
 #[derive(Clone, PartialEq, Debug)]
 pub struct HudView {
@@ -87,6 +112,8 @@ pub struct HudView {
     pub fade_ms: u32,
     /// Vocal-rest toast text (see [`crate::vocal_rest_toast`]).
     pub toast: Option<String>,
+    /// Resonance indicator; `None` while resonance feedback is off. Ignored in `color` mode.
+    pub resonance: Option<ResonanceView>,
 }
 
 /// Everything that influences the pixels, in quantised form.
@@ -98,6 +125,35 @@ struct Key {
     f0_text: Option<i32>,
     marker_y2: Option<i32>,
     band_y2: (i32, i32),
+    res: ResKey,
+}
+
+/// Quantised resonance indicator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResKey {
+    Off,
+    Gathering,
+    /// Dim bar with a short explanation in the label column.
+    Message(ResMessage),
+    /// Marker at y × 2 (half-pixel steps).
+    Marker(i32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResMessage {
+    Uncalibrated,
+    TooSimilar,
+    NeedsBypass,
+}
+
+impl ResMessage {
+    fn text(self) -> &'static str {
+        match self {
+            ResMessage::Uncalibrated => STRINGS.hud_res_uncalibrated,
+            ResMessage::TooSimilar => STRINGS.hud_res_too_similar,
+            ResMessage::NeedsBypass => STRINGS.hud_res_needs_bypass,
+        }
+    }
 }
 
 struct Transition {
@@ -230,8 +286,18 @@ impl Hud {
     fn key(&self, view: &HudView, color: Rgba) -> Key {
         let detailed = view.display == DisplayMode::Detailed;
         let (mut f0_text, mut marker_y2, mut band_y2) = (None, None, (0, 0));
+        let mut res = ResKey::Off;
         if detailed {
-            let bar = BarGeom::new(view.span);
+            res = view.resonance.map_or(ResKey::Off, |r| match r {
+                ResonanceView::Position(p) if p.is_finite() => {
+                    ResKey::Marker((res_y_of(p) * 2.0).round() as i32)
+                }
+                ResonanceView::Position(_) | ResonanceView::Gathering => ResKey::Gathering,
+                ResonanceView::Uncalibrated => ResKey::Message(ResMessage::Uncalibrated),
+                ResonanceView::TooSimilar => ResKey::Message(ResMessage::TooSimilar),
+                ResonanceView::NeedsBypass => ResKey::Message(ResMessage::NeedsBypass),
+            });
+            let bar = BarGeom::new(view.span, res != ResKey::Off);
             let f0 = view.f0_hz.filter(|f| f.is_finite() && *f > 0.0);
             if view.state.voiced() {
                 f0_text = f0.map(|f| f.round() as i32);
@@ -247,6 +313,7 @@ impl Hud {
             f0_text,
             marker_y2,
             band_y2,
+            res,
         }
     }
 
@@ -263,7 +330,7 @@ impl Hud {
 
     fn draw_detailed(&mut self, view: &HudView, key: Key, tile: Rgba) {
         let fg = view.state.foreground();
-        let bar = BarGeom::new(view.span);
+        let bar = BarGeom::new(view.span, key.res != ResKey::Off);
         // Track, band, marker.
         draw::fill_rounded(&mut self.pixmap, bar.track, bar.track.w / 2.0, Rgba::hex(0, 80));
         let (y_hi, y_lo) = (key.band_y2.1 as f32 / 2.0, key.band_y2.0 as f32 / 2.0);
@@ -276,6 +343,9 @@ impl Hud {
             let m = R::new(bar.track.x - 9.0, y - 6.0, bar.track.w + 18.0, 12.0);
             draw::fill_rounded(&mut self.pixmap, m, 6.0, Rgba::hex(0xFFFFFF, 255));
             draw::stroke_rounded(&mut self.pixmap, m, 6.0, 2.5, Rgba::hex(0x101010, 200));
+        }
+        if key.res != ResKey::Off {
+            self.draw_resonance(key.res);
         }
 
         // Text area left of the bar.
@@ -351,7 +421,7 @@ impl Hud {
     }
 
     fn draw_toast(&mut self, toast: &str) {
-        let max_w = HUD_WIDTH_PX as f32 - 16.0 - 36.0;
+        let max_w = TOAST_MAX_W;
         let mut px = 28.0;
         loop {
             self.text.wrap(Weight::Regular, px, max_w, toast, &mut self.wrap);
@@ -388,6 +458,84 @@ impl Hud {
             );
         }
     }
+
+    /// Resonance bar right of the range bar; tick labels or the state message go in the label
+    /// column right of the tile. Never touches the tile colour.
+    fn draw_resonance(&mut self, res: ResKey) {
+        let lit = matches!(res, ResKey::Marker(_));
+        let track = RES_TRACK;
+        let track_alpha = if lit { 90 } else { 40 };
+        draw::fill_rounded(&mut self.pixmap, track, track.w / 2.0, Rgba::hex(0, track_alpha));
+        match res {
+            ResKey::Off => {}
+            ResKey::Message(msg) => self.draw_message_box(msg.text()),
+            ResKey::Gathering | ResKey::Marker(_) => {
+                let alpha = if lit { 235 } else { 120 };
+                let white = Rgba::hex(0xFFFFFF, alpha);
+                for (p, label) in [(0.0, STRINGS.hud_res_relaxed), (1.0, STRINGS.hud_res_target)] {
+                    let y = res_y_of(p);
+                    draw::line(&mut self.pixmap, (track.x - 5.0, y), (track.right() + 5.0, y), 3.0, white);
+                    draw::line(&mut self.pixmap, (track.right() + 5.0, y), (LABEL_X, y), 1.5, white.with_alpha(alpha / 2));
+                    self.draw_tick_label(label, y, alpha);
+                }
+                if let ResKey::Marker(y2) = res {
+                    let y = y2 as f32 / 2.0;
+                    draw::fill_circle(&mut self.pixmap, track.cx(), y, 11.5, Rgba::hex(0x101010, 220));
+                    draw::fill_circle(&mut self.pixmap, track.cx(), y, 9.0, Rgba::hex(0xFFFFFF, 255));
+                }
+            }
+        }
+    }
+
+    fn draw_tick_label(&mut self, label: &str, y: f32, alpha: u8) {
+        let pad = 8.0;
+        let px = self.text.fit(Weight::SemiBold, 24.0, 14.0, LABEL_W - 2.0 * pad, label);
+        let w = self.text.measure(Weight::SemiBold, px, label).min(LABEL_W - 2.0 * pad);
+        let bx = R::new(LABEL_X, y - 17.0, w + 2.0 * pad, 34.0);
+        draw::fill_rounded(&mut self.pixmap, bx, 10.0, LABEL_BG.with_alpha(alpha.min(LABEL_BG.a)));
+        let base = bx.cy() + TextRenderer::cap_height(Weight::SemiBold, px) / 2.0;
+        let color = Rgba::hex(0xFFFFFF, alpha);
+        self.text.draw(&mut self.pixmap, Weight::SemiBold, px, bx.x + pad, base, Align::Left, label, color, Some(bx.clip()));
+    }
+
+    /// Wrapped explanation in the label column, vertically centred on the tile.
+    fn draw_message_box(&mut self, text: &str) {
+        const MAX_LINES: usize = 5;
+        let pad = 9.0;
+        let max_w = LABEL_W - 2.0 * pad;
+        let mut px = 23.0;
+        loop {
+            self.text.wrap(Weight::Regular, px, max_w, text, &mut self.wrap);
+            let widest = self.wrap.iter().fold(0.0f32, |m, &(s, e)| {
+                m.max(self.text.measure(Weight::Regular, px, &text[s..e]))
+            });
+            if (self.wrap.len() <= MAX_LINES && widest <= max_w) || px <= 15.0 {
+                break;
+            }
+            px -= 1.0;
+        }
+        let lines = self.wrap.len().min(MAX_LINES);
+        let line_h = (px * 1.25).round();
+        let bx_h = lines as f32 * line_h + 2.0 * pad;
+        let bx = R::new(LABEL_X, TILE.cy() - bx_h / 2.0, LABEL_W, bx_h);
+        draw::fill_rounded(&mut self.pixmap, bx, 12.0, LABEL_BG);
+        let ascent = TextRenderer::cap_height(Weight::Regular, px);
+        let first_base = bx.y + pad + (line_h - ascent) / 2.0 + ascent;
+        for i in 0..lines {
+            let (s, e) = self.wrap[i];
+            self.text.draw(
+                &mut self.pixmap,
+                Weight::Regular,
+                px,
+                bx.x + pad,
+                first_base + i as f32 * line_h,
+                Align::Left,
+                &text[s..e],
+                Rgba::hex(0xFFFFFF, 255),
+                Some(bx.clip()),
+            );
+        }
+    }
 }
 
 /// Geometry of the vertical range bar inside the tile (detailed mode).
@@ -401,8 +549,10 @@ struct BarGeom {
 }
 
 impl BarGeom {
-    fn new(span: (f32, f32)) -> Self {
-        let track = R::new(TILE.x + 190.0, TILE.y + 22.0, 34.0, TILE.h - 44.0);
+    /// `beside_resonance` shifts the bar left to make room for the resonance bar.
+    fn new(span: (f32, f32), beside_resonance: bool) -> Self {
+        let x = if beside_resonance { RES_TRACK.x - 52.0 } else { TILE.x + 190.0 };
+        let track = R::new(x, TILE.y + 22.0, 34.0, TILE.h - 44.0);
         let lo = span.0.max(1.0);
         let hi = span.1.max(lo * 1.01);
         Self {
@@ -426,6 +576,17 @@ fn band_px(bar: &BarGeom, band: (f32, f32)) -> (f32, f32) {
     (bar.y_of(band.0), bar.y_of(band.1))
 }
 
+/// The thin resonance bar right of the range bar (§4.1, §5.1).
+const RES_TRACK: R = R::new(TILE.x + 222.0, TILE.y + 22.0, 14.0, TILE.h - 44.0);
+
+/// y of resonance position `p`, clamped to [`RESONANCE_DISPLAY_RANGE`]; brighter is higher.
+fn res_y_of(p: f32) -> f32 {
+    let (lo, hi) = RESONANCE_DISPLAY_RANGE;
+    let (top, bottom) = (RES_TRACK.y + 8.0, RES_TRACK.y + RES_TRACK.h - 8.0);
+    let frac = (p.clamp(lo, hi) - lo) / (hi - lo);
+    bottom - frac * (bottom - top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,8 +600,116 @@ mod tests {
             display,
             fade_ms: 300,
             toast: None,
+            resonance: None,
         }
     }
+
+    fn pixel(hud: &Hud, x: f32, y: f32) -> (u8, u8, u8, u8) {
+        let p = hud.pixmap.pixel(x as u32, y as u32).unwrap();
+        (p.red(), p.green(), p.blue(), p.alpha())
+    }
+
+    #[test]
+    fn resonance_is_ignored_in_color_mode() {
+        let mut hud = Hud::new();
+        let t0 = Instant::now();
+        let mut v = view(HudState::InRange, DisplayMode::Color);
+        assert!(hud.render(&v, t0).is_some());
+        v.resonance = Some(ResonanceView::Position(0.5));
+        assert!(hud.render(&v, t0).is_none());
+        v.resonance = Some(ResonanceView::Uncalibrated);
+        assert!(hud.render(&v, t0).is_none());
+    }
+
+    #[test]
+    fn resonance_rerenders_only_on_visible_changes() {
+        let mut hud = Hud::new();
+        let t0 = Instant::now();
+        let mut v = view(HudState::InRange, DisplayMode::Detailed);
+        assert!(hud.render(&v, t0).is_some());
+        v.resonance = Some(ResonanceView::Gathering);
+        assert!(hud.render(&v, t0).is_some(), "bar appears");
+        assert!(hud.render(&v, t0).is_none());
+        v.resonance = Some(ResonanceView::Position(0.5));
+        assert!(hud.render(&v, t0).is_some(), "marker appears");
+        v.resonance = Some(ResonanceView::Position(0.5005));
+        assert!(hud.render(&v, t0).is_none(), "sub-half-pixel move");
+        v.resonance = Some(ResonanceView::Position(0.6));
+        assert!(hud.render(&v, t0).is_some());
+        // Beyond the display range the marker is pinned to the ends.
+        v.resonance = Some(ResonanceView::Position(1.25));
+        assert!(hud.render(&v, t0).is_some());
+        v.resonance = Some(ResonanceView::Position(4.0));
+        assert!(hud.render(&v, t0).is_none(), "clamped to 1.25");
+        v.resonance = Some(ResonanceView::Position(-0.25));
+        assert!(hud.render(&v, t0).is_some());
+        v.resonance = Some(ResonanceView::Position(-9.0));
+        assert!(hud.render(&v, t0).is_none(), "clamped to -0.25");
+        for state in [ResonanceView::Uncalibrated, ResonanceView::TooSimilar, ResonanceView::NeedsBypass] {
+            v.resonance = Some(state);
+            assert!(hud.render(&v, t0).is_some(), "{state:?}");
+            assert!(hud.render(&v, t0).is_none(), "{state:?}");
+        }
+        v.resonance = Some(ResonanceView::Position(f32::NAN));
+        assert!(hud.render(&v, t0).is_some());
+        v.resonance = Some(ResonanceView::Gathering);
+        assert!(hud.render(&v, t0).is_none(), "non-finite p is shown as gathering");
+        v.resonance = None;
+        assert!(hud.render(&v, t0).is_some(), "bar disappears");
+    }
+
+    #[test]
+    fn resonance_marker_maps_relaxed_and_target_to_the_ticks() {
+        let key = |p: f32| {
+            let mut v = view(HudState::InRange, DisplayMode::Detailed);
+            v.resonance = Some(ResonanceView::Position(p));
+            Hud::new().key(&v, HudState::InRange.color()).res
+        };
+        assert_eq!(key(0.0), ResKey::Marker((res_y_of(0.0) * 2.0).round() as i32));
+        assert_eq!(key(1.0), ResKey::Marker((res_y_of(1.0) * 2.0).round() as i32));
+        assert!(res_y_of(1.0) < res_y_of(0.0), "target (brighter) is higher");
+        assert!(res_y_of(1.25) >= RES_TRACK.y && res_y_of(-0.25) <= RES_TRACK.bottom());
+        // Pitch bar, resonance bar and label column do not overlap and stay inside the canvas.
+        let bar = BarGeom::new((60.0, 500.0), true);
+        assert!(bar.track.right() + 9.0 < RES_TRACK.x - 5.0, "pitch marker clears the resonance ticks");
+        assert!(RES_TRACK.right() + 5.0 < TILE.right());
+        assert!(LABEL_X > TILE.right() && LABEL_X + LABEL_W <= HUD_WIDTH_PX as f32);
+    }
+
+    #[test]
+    fn overlay_width_keeps_the_tile_at_size_m() {
+        for size in [0.02, 0.05, 0.2] {
+            let tile_m = hud_overlay_width_m(size) * TILE.w / HUD_WIDTH_PX as f32;
+            assert!((tile_m - size).abs() < 1e-6, "{size}: tile {tile_m}");
+        }
+        assert_eq!(TILE.cx(), HUD_WIDTH_PX as f32 / 2.0, "tile centred: the transform places the tile");
+    }
+
+    #[test]
+    fn resonance_never_changes_the_tile_colour() {
+        let t0 = Instant::now();
+        let probe = (TILE.x + 40.0, TILE.y + 8.0);
+        for state in STATES_UNDER_TEST {
+            let mut off = Hud::new();
+            off.render(&view(state, DisplayMode::Detailed), t0).unwrap();
+            for res in [
+                ResonanceView::Gathering,
+                ResonanceView::Uncalibrated,
+                ResonanceView::TooSimilar,
+                ResonanceView::NeedsBypass,
+                ResonanceView::Position(1.1),
+            ] {
+                let mut on = Hud::new();
+                let mut v = view(state, DisplayMode::Detailed);
+                v.resonance = Some(res);
+                on.render(&v, t0).unwrap();
+                assert_eq!(pixel(&on, probe.0, probe.1), pixel(&off, probe.0, probe.1), "{state:?} {res:?}");
+            }
+        }
+    }
+
+    const STATES_UNDER_TEST: [HudState; 5] =
+        [HudState::InRange, HudState::OutOfRange, HudState::NoVoice, HudState::Muted, HudState::NoMic];
 
     #[test]
     fn first_render_is_some_then_none_when_unchanged() {

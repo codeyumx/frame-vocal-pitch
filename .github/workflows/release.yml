@@ -35,7 +35,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev \
-            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev
+            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev mesa-vulkan-drivers
 
       - name: Versions
         run: |
@@ -62,7 +62,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev \
-            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev
+            libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev mesa-vulkan-drivers
 
       - name: Versions
         run: |

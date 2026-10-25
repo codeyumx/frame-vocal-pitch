@@ -6,7 +6,10 @@
 //! classification hysteresis, `no_voice` timeout).
 //!
 //! [`ReminderTimer`] and [`VocalRest`] implement the two time-based features
-//! that consume the tracker output. All tunable constants live in [`params`].
+//! that consume the tracker output. [`ResonanceTracker`] and [`Calibration`]
+//! implement the experimental resonance feedback (SPEC §5.1) on the frames
+//! that [`Detector::push_with`] exposes. All tunable constants live in
+//! [`params`].
 //!
 //! Nothing in this crate allocates per hop after construction; the caller owns
 //! the `Vec<Hop>` passed to [`Detector::push`] and should reuse it.
@@ -18,16 +21,23 @@ mod analyze;
 mod decimate;
 pub mod params;
 mod reminder;
+mod resonance;
 mod tracker;
 mod vocal_rest;
 mod yin;
 
-pub use analyze::{analyze, bench};
+pub use analyze::{analyze, bench, bench_resonance};
 pub use params::PitchParams;
 pub use reminder::ReminderTimer;
+pub use resonance::{
+    accepts, formant_spacing, position, too_similar, CalibError, Calibration, FormantAnalyzer,
+    Formants, ResonanceState, ResonanceTracker,
+};
 pub use tracker::{Class, PitchState, Tracker};
 pub use vocal_rest::VocalRest;
-pub use yin::{Detector, Hop};
+pub use yin::{AnalysisFrame, Detector, Hop};
 
+#[cfg(test)]
+mod resonance_tests;
 #[cfg(test)]
 mod tests;

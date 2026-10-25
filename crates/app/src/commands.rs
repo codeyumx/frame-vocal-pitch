@@ -129,12 +129,20 @@ fn summary(hops: &[(f64, Option<f32>, Class)], band: (f32, f32)) -> String {
     )
 }
 
-/// `--bench`: analysis cost per 10 ms hop.
+/// `--bench`: analysis cost per 10 ms hop, with and without resonance feedback (SPEC §5.1).
 pub fn bench() -> Result<u8, Box<dyn Error>> {
-    let us_per_hop = fvp_pitch::bench();
-    let share = us_per_hop / (fvp_pitch::params::HOP_S * 1e6) * 100.0;
+    let hop_us = fvp_pitch::params::HOP_S * 1e6;
+    let pitch = fvp_pitch::bench();
+    let total = fvp_pitch::bench_resonance();
     println!("{}", crate::VERSION_LINE);
-    println!("Analysis: {us_per_hop:.1} µs/hop ({share:.2} % of one core)");
+    println!(
+        "Analysis: {pitch:.1} µs/hop ({:.2} % of one core)",
+        pitch / hop_us * 100.0
+    );
+    println!(
+        "Analysis + resonance: {total:.1} µs/hop ({:.2} % of one core)",
+        total / hop_us * 100.0
+    );
     Ok(exit::OK)
 }
 

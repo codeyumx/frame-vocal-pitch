@@ -1,6 +1,7 @@
 //! Analysis thread (SPEC §3): pulls 48 kHz mono samples from the capture ring
-//! buffer, runs [`Detector`] + [`Tracker`] + [`ReminderTimer`] + [`VocalRest`],
-//! and publishes the latest [`PitchState`] to the main loop.
+//! buffer, runs [`Detector`] + [`Tracker`] + [`ReminderTimer`] + [`VocalRest`]
+//! and, for the experimental resonance indicator (§5.1), a
+//! [`ResonanceTracker`] plus an optional [`Calibration`].
 //!
 //! The main loop never blocks on this thread: the published snapshot sits behind
 //! one short-lived mutex, and a byte written to a non-blocking socket wakes the
@@ -16,8 +17,10 @@ use std::time::Duration;
 use fvp_config::Config;
 use fvp_pitch::params::{INPUT_RATE_HZ, TONE_DURATION_MS};
 use fvp_pitch::{
-    Detector, Hop, PitchParams, PitchState, ReminderTimer, Tracker, VocalRest,
+    AnalysisFrame, Calibration, Detector, Hop, PitchParams, PitchState, ReminderTimer,
+    ResonanceState, ResonanceTracker, Tracker, VocalRest,
 };
+use fvp_ui::CalibWhich;
 
 /// Reminder tone length (SPEC §5): a tone request is one `play()` call.
 pub const TONE_MS: u32 = TONE_DURATION_MS;
@@ -28,6 +31,8 @@ const CHUNK: usize = 480;
 /// Sleep while the ring buffer is empty. Half a hop: no detectable latency, and
 /// the thread never spins.
 const STARVED: Duration = Duration::from_millis(5);
+/// Position grid used to decide whether the resonance marker moved enough to redraw.
+const RESONANCE_STEP: f32 = 0.003;
 
 /// Everything the analysis thread derives from the configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,6 +47,13 @@ pub struct Control {
     /// Nothing visible needs pitch and the vocal-rest timer is off, so the
     /// samples are drained and discarded (SPEC §4.1 "stop rendering").
     pub paused: bool,
+    /// Resonance indicator is on (SPEC §5.1): run the formant tracker.
+    pub resonance_enabled: bool,
+    pub resonance_window_s: f32,
+    pub relaxed_df_hz: Option<f32>,
+    pub target_df_hz: Option<f32>,
+    /// Active mic mode; a change resets the resonance window (§5.1).
+    pub mic_mode: fvp_config::MicMode,
 }
 
 impl Control {
@@ -59,23 +71,55 @@ impl Control {
             vocal_rest_minutes: cfg.vocal_rest.minutes,
             muted,
             paused,
+            resonance_enabled: cfg.resonance.enabled,
+            resonance_window_s: cfg.resonance.window_s,
+            relaxed_df_hz: cfg.resonance.relaxed_df_hz,
+            target_df_hz: cfg.resonance.target_df_hz,
+            mic_mode: cfg.audio.mic_mode,
         }
     }
 }
 
+/// Progress of a calibration recording reported to the main loop (§5.1).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CalibUpdate {
+    /// Recording, `progress` runs from 0 to 1 over the 10 s.
+    Progress { which: CalibWhich, progress: f32 },
+    /// Finished; `df_hz` is the median formant spacing of the accepted frames.
+    Done { which: CalibWhich, df_hz: f32 },
+    /// The recording was abandoned with a message to show as is.
+    Failed { which: CalibWhich, message: String },
+}
+
+/// Requests from the main loop.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    /// Begin a 10 s recording of `which`.
+    Start(CalibWhich),
+    /// Drop the running recording silently (resonance off, mic mode changed).
+    Abort,
+    /// Drop the running recording and report this message (muted, no mic).
+    Fail(String),
+}
+
 /// What the main loop reads: the newest state plus one-shot events.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub state: Option<PitchState>,
     /// The reminder tone is due; cleared when read.
     pub reminder_due: bool,
     /// A vocal-rest toast is due with this many voiced minutes; cleared when read.
     pub toast_minutes: Option<u32>,
+    /// Resonance indicator state while the tracker runs (SPEC §5.1).
+    pub resonance: Option<ResonanceState>,
+    /// Calibration progress or result since the last read.
+    pub calib: Option<CalibUpdate>,
 }
 
 struct Shared {
     inner: Mutex<Snapshot>,
-    /// Some overlay shows live pitch data, so per-hop F0 changes are worth waking for.
+    commands: Mutex<Vec<Command>>,
+    /// Some overlay shows live pitch data, so per-hop changes are worth waking for.
     live: AtomicBool,
     waker: UnixStream,
 }
@@ -99,6 +143,7 @@ impl Analysis {
         wake_rx.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             inner: Mutex::new(Snapshot::default()),
+            commands: Mutex::new(Vec::new()),
             live: AtomicBool::new(true),
             waker,
         });
@@ -126,9 +171,10 @@ impl Analysis {
     /// Newest state, consuming the pending one-shot events.
     pub fn take(&self) -> Snapshot {
         let mut inner = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = *inner;
+        let snapshot = inner.clone();
         inner.reminder_due = false;
         inner.toast_minutes = None;
+        inner.calib = None;
         snapshot
     }
 
@@ -140,6 +186,29 @@ impl Analysis {
     /// Whether an overlay currently shows live pitch data.
     pub fn set_live(&self, live: bool) {
         self.shared.live.store(live, Ordering::Relaxed);
+    }
+
+    /// Asks the thread to start a 10 s calibration recording (§5.1).
+    pub fn start_calibration(&self, which: CalibWhich) {
+        self.push(Command::Start(which));
+    }
+
+    /// Drops the running recording without a message.
+    pub fn abort_calibration(&self) {
+        self.push(Command::Abort);
+    }
+
+    /// Drops the running recording and reports `message`.
+    pub fn fail_calibration(&self, message: impl Into<String>) {
+        self.push(Command::Fail(message.into()));
+    }
+
+    fn push(&self, command: Command) {
+        self.shared
+            .commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(command);
     }
 
     fn stop(&mut self) {
@@ -167,7 +236,8 @@ fn run(
     let mut tracker = Tracker::new(applied.band.0, applied.band.1);
     let mut reminder = ReminderTimer::new(applied.reminder_delay_s);
     let mut vocal = VocalRest::new(applied.vocal_rest_minutes);
-    let mut hops: Vec<Hop> = Vec::with_capacity(8);
+    let mut resonance = ResonanceTracker::new(applied.resonance_window_s);
+    let mut recording: Option<(CalibWhich, Calibration)> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let wanted = *control.lock().unwrap_or_else(|e| e.into_inner());
@@ -184,7 +254,39 @@ fn run(
             if wanted.vocal_rest_minutes != applied.vocal_rest_minutes {
                 vocal.set_minutes(wanted.vocal_rest_minutes);
             }
+            if wanted.resonance_window_s != applied.resonance_window_s {
+                resonance.set_window(wanted.resonance_window_s);
+                resonance.reset();
+            }
+            if wanted.mic_mode != applied.mic_mode {
+                // SPEC §5.1: the window is not comparable across mic modes.
+                resonance.reset();
+            }
             applied = wanted;
+        }
+
+        for command in drain_commands(&shared) {
+            match command {
+                Command::Start(which) => {
+                    recording = Some((which, Calibration::new()));
+                    publish_calib(
+                        &shared,
+                        CalibUpdate::Progress {
+                            which,
+                            progress: 0.0,
+                        },
+                    );
+                }
+                Command::Abort => recording = None,
+                Command::Fail(message) => {
+                    if let Some((which, _)) = recording.take() {
+                        publish_calib(
+                            &shared,
+                            CalibUpdate::Failed { which, message },
+                        );
+                    }
+                }
+            }
         }
 
         let slots = consumer.slots().min(CHUNK);
@@ -201,34 +303,78 @@ fn run(
             chunk.commit_all();
             continue;
         }
-        hops.clear();
-        {
-            let (first, second) = chunk.as_slices();
-            detector.push(first, &mut hops);
-            detector.push(second, &mut hops);
-        }
-        chunk.commit_all();
-        if hops.is_empty() {
-            continue;
-        }
-
+        // SPEC §5.1: the formant tracker only runs when it is on or calibrating.
+        let resonance_wanted = applied.resonance_enabled || recording.is_some();
         let mut due = false;
         let mut toast = None;
         let mut state = None;
-        for hop in &hops {
-            let current = tracker.update(hop);
-            if applied.reminder_enabled {
-                due |= reminder.update(current.t_s, current.class);
-            } else {
-                reminder.reset();
-            }
-            if let Some(minutes) = vocal.update_hop(hop) {
-                toast = Some(minutes);
-            }
-            state = Some(current);
+        let mut finished: Option<(CalibWhich, Result<f32, fvp_pitch::CalibError>)> = None;
+        {
+            let mut on_hop = |hop: Hop, frame: AnalysisFrame<'_>| {
+                let current = tracker.update(&hop);
+                if applied.reminder_enabled {
+                    due |= reminder.update(current.t_s, current.class);
+                } else {
+                    reminder.reset();
+                }
+                if let Some(minutes) = vocal.update_hop(&hop) {
+                    toast = Some(minutes);
+                }
+                let df = if resonance_wanted {
+                    resonance.update(&hop, frame)
+                } else {
+                    None
+                };
+                if let Some((_, calibration)) = recording.as_mut() {
+                    calibration.push(df);
+                    if calibration.is_done() {
+                        let (which, calibration) = recording.take().unwrap();
+                        finished = Some((which, calibration.finish()));
+                    }
+                }
+                state = Some(current);
+            };
+            let (first, second) = chunk.as_slices();
+            detector.push_with(first, &mut on_hop);
+            detector.push_with(second, &mut on_hop);
         }
-        publish(&shared, state, due, toast);
+        chunk.commit_all();
+        if state.is_none() {
+            continue;
+        }
+
+        let resonance_state = if resonance_wanted {
+            Some(resonance.state(applied.relaxed_df_hz, applied.target_df_hz))
+        } else {
+            None
+        };
+        let calib = match finished {
+            Some((which, Ok(df_hz))) => Some(CalibUpdate::Done { which, df_hz }),
+            Some((which, Err(e))) => Some(CalibUpdate::Failed {
+                which,
+                message: e.to_string(),
+            }),
+            None => recording.as_ref().map(|(which, calibration)| CalibUpdate::Progress {
+                which: *which,
+                progress: calibration.progress(),
+            }),
+        };
+        publish(&shared, state, due, toast, resonance_state, calib);
     }
+}
+
+fn drain_commands(shared: &Shared) -> Vec<Command> {
+    let mut pending = shared.commands.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *pending)
+}
+
+/// Stores a calibration update and wakes the main loop.
+fn publish_calib(shared: &Shared, update: CalibUpdate) {
+    {
+        let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.calib = Some(update);
+    }
+    wake(shared);
 }
 
 /// Stores the newest state and wakes the main loop when it would render differently.
@@ -237,11 +383,18 @@ fn publish(
     state: Option<PitchState>,
     due: bool,
     toast: Option<u32>,
+    resonance: Option<ResonanceState>,
+    calib: Option<CalibUpdate>,
 ) {
     let Some(new_state) = state else {
+        if let Some(update) = calib {
+            publish_calib(shared, update);
+        }
         return;
     };
-    let wake = {
+    let has_calib = calib.is_some();
+    let needs_wake = {
+        let live = shared.live.load(Ordering::Relaxed);
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         let previous = inner.state;
         inner.state = Some(new_state);
@@ -249,6 +402,20 @@ fn publish(
         if toast.is_some() {
             inner.toast_minutes = toast;
         }
+        if calib.is_some() {
+            inner.calib = calib;
+        }
+        let resonance_changed = {
+            let previous = inner.resonance;
+            inner.resonance = resonance;
+            match (previous, resonance) {
+                (None, None) => false,
+                (Some(ResonanceState::Position(before)), Some(ResonanceState::Position(after))) => {
+                    (before - after).abs() >= RESONANCE_STEP && live
+                }
+                (before, after) => before != after,
+            }
+        };
         let class_changed = previous.is_some_and(|p| p.class != new_state.class);
         let f0_changed = match (previous.and_then(|p| p.f0_hz), new_state.f0_hz) {
             (Some(before), Some(after)) => (before.round()) != (after.round()),
@@ -259,13 +426,19 @@ fn publish(
             || class_changed
             || due
             || toast.is_some()
-            || (f0_changed && shared.live.load(Ordering::Relaxed))
+            || has_calib
+            || resonance_changed
+            || (f0_changed && live)
     };
-    if wake {
-        // A full socket means a wake-up is already pending; losing a byte is fine.
-        let mut waker = &shared.waker;
-        let _ = waker.write(&[1]);
+    if needs_wake {
+        wake(shared);
     }
+}
+
+/// Wakes the main loop; a full socket means a wake-up is already pending.
+fn wake(shared: &Shared) {
+    let mut waker = &shared.waker;
+    let _ = waker.write(&[1]);
 }
 
 /// Drains the wake socket without blocking.
@@ -291,25 +464,62 @@ mod tests {
         Control::from_config(&Config::default(), false, false)
     }
 
-    /// Feeds a 220 Hz sine through the real pipeline and reads it back through the API.
+    /// Pushes `samples` into the ring, waiting whenever the buffer is full.
+    fn feed(producer: &mut rtrb::Producer<f32>, samples: &[f32]) {
+        for &sample in samples {
+            while producer.push(sample).is_err() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn sine(f0: f64, seconds: f64) -> Vec<f32> {
+        let rate = 48_000.0;
+        (0..(rate * seconds) as usize)
+            .map(|i| (i as f64 / rate * f0 * std::f64::consts::TAU).sin() as f32 * 0.5)
+            .collect()
+    }
+
+    /// Glottal pulse train through three formant resonators (a synthetic vowel).
+    fn vowel(f0: f64, formants: [f64; 3], seconds: f64) -> Vec<f32> {
+        let rate = 48_000.0f64;
+        let n = (rate * seconds) as usize;
+        let period = (rate / f0).round() as usize;
+        // Impulse train: a pulse every glottal period, with a little tilt.
+        let mut source = vec![0.0f64; n];
+        let mut i = 0;
+        while i < n {
+            source[i] = 1.0;
+            if i + 1 < n {
+                source[i + 1] = -0.7;
+            }
+            i += period;
+        }
+        let mut signal = source;
+        for &formant in &formants {
+            let r = (-std::f64::consts::PI * 100.0 / rate).exp();
+            let theta = std::f64::consts::TAU * formant / rate;
+            let (a1, a2) = (2.0 * r * theta.cos(), -(r * r));
+            let mut y1 = 0.0;
+            let mut y2 = 0.0;
+            for sample in &mut signal {
+                let y = *sample + a1 * y1 + a2 * y2;
+                y2 = y1;
+                y1 = y;
+                *sample = y;
+            }
+        }
+        let peak = signal.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let scale = if peak > 0.0 { 0.5 / peak } else { 0.0 };
+        signal.iter().map(|v| (v * scale) as f32).collect()
+    }
+
     #[test]
     fn publishes_pitch_state() {
         let (mut producer, consumer) = rtrb::RingBuffer::new(48_000);
         let (analysis, wake_rx) = Analysis::spawn(consumer, control()).unwrap();
 
-        let mut phase = 0.0f64;
-        let mut block = Vec::with_capacity(4_800);
-        for _ in 0..4_800 * 6 {
-            block.push((phase * std::f64::consts::TAU).sin() as f32 * 0.5);
-            phase = (phase + 220.0 / 48_000.0).fract();
-            if block.len() == 4_800 {
-                for sample in block.drain(..) {
-                    while producer.push(sample).is_err() {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-        }
+        feed(&mut producer, &sine(220.0, 6.0));
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -340,5 +550,95 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         drain(&wake_rx);
         assert!(analysis.take().state.is_none(), "muted input was analysed");
+    }
+
+    #[test]
+    fn resonance_runs_only_when_enabled() {
+        let (mut producer, consumer) = rtrb::RingBuffer::new(48_000);
+        let (analysis, wake_rx) = Analysis::spawn(consumer, control()).unwrap();
+        feed(&mut producer, &sine(150.0, 4.0));
+        std::thread::sleep(Duration::from_millis(150));
+        drain(&wake_rx);
+        let snapshot = analysis.take();
+        assert!(snapshot.state.is_some(), "pitch should still be published");
+        assert!(
+            snapshot.resonance.is_none(),
+            "resonance tracker ran while disabled"
+        );
+    }
+
+    #[test]
+    fn calibration_records_and_reports_a_formant_spacing() {
+        let (mut producer, consumer) = rtrb::RingBuffer::new(96_000);
+        let mut cfg = control();
+        cfg.resonance_enabled = true;
+        let (analysis, wake_rx) = Analysis::spawn(consumer, cfg).unwrap();
+
+        analysis.start_calibration(CalibWhich::Relaxed);
+        // 12 s: 10 s of recording plus slack for the ring buffer. Fed from a second
+        // thread so the test can observe progress while the recording runs.
+        let samples = vowel(150.0, [700.0, 1200.0, 2600.0], 12.0);
+        let feeder = std::thread::spawn(move || feed(&mut producer, &samples));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut saw_progress = false;
+        let result = loop {
+            drain(&wake_rx);
+            match analysis.take().calib {
+                Some(CalibUpdate::Progress { which, progress }) => {
+                    assert_eq!(which, CalibWhich::Relaxed);
+                    saw_progress |= progress > 0.0;
+                }
+                Some(CalibUpdate::Done { which, df_hz }) => {
+                    assert_eq!(which, CalibWhich::Relaxed);
+                    break Ok(df_hz);
+                }
+                Some(CalibUpdate::Failed { message, .. }) => break Err(message),
+                None => {}
+            }
+            assert!(Instant::now() < deadline, "calibration never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        // Keep draining until the feeder is done, then stop the thread.
+        feeder.join().unwrap();
+        drop(analysis);
+        let df_hz = match result {
+            Ok(df_hz) => df_hz,
+            Err(message) => panic!("calibration failed: {message}"),
+        };
+        assert!(saw_progress, "no progress was published");
+        // /a/ at 700/1200/2600 Hz implies ΔF ≈ 990 Hz under the uniform-tube fit.
+        assert!(
+            (600.0..1400.0).contains(&df_hz),
+            "implausible ΔF {df_hz} Hz"
+        );
+    }
+
+    #[test]
+    fn abort_and_fail_commands_stop_the_recording() {
+        let (_producer, consumer) = rtrb::RingBuffer::new(4_800);
+        let (analysis, _wake_rx) = Analysis::spawn(consumer, control()).unwrap();
+
+        analysis.start_calibration(CalibWhich::Target);
+        analysis.fail_calibration("Mic muted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(CalibUpdate::Failed { which, message }) = analysis.take().calib {
+                assert_eq!(which, CalibWhich::Target);
+                assert_eq!(message, "Mic muted");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no failure was published");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // An abort reports nothing at all.
+        analysis.start_calibration(CalibWhich::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = analysis.take();
+        analysis.abort_calibration();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(analysis.take().calib.is_none(), "abort published an update");
     }
 }

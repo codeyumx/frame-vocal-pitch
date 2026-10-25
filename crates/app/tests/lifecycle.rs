@@ -130,23 +130,30 @@ fn probe_reports_the_environment_without_steamvr() {
 }
 
 #[test]
-fn bench_prints_microseconds_per_hop() {
+fn bench_prints_both_microsecond_lines() {
     let sb = Sandbox::new("bench");
     let out = sb.run(&["--bench"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let line = stdout
-        .lines()
-        .find(|line| line.contains("µs/hop"))
-        .unwrap_or_else(|| panic!("no µs/hop line in {stdout}"));
-    let micros: f64 = line
-        .split("Analysis: ")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("no number in {line}"));
-    assert!(micros > 0.0 && micros < 10_000.0, "{micros}");
+
+    let micros = |prefix: &str| -> f64 {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(prefix) && line.contains("µs/hop"))
+            .unwrap_or_else(|| panic!("no '{prefix}' line in {stdout}"));
+        let value: f64 = line
+            .split(' ')
+            .find_map(|token| token.parse().ok())
+            .unwrap_or_else(|| panic!("no number in {line}"));
+        assert!(value > 0.0 && value < 10_000.0, "{value} in {line}");
+        assert!(line.contains("% of one core"), "{line}");
+        value
+    };
+    let pitch = micros("Analysis: ");
+    let both = micros("Analysis + resonance: ");
+    // The combined figure includes the pitch path, so it can never be cheaper.
+    assert!(both >= pitch, "resonance cost {both} < pitch {pitch}");
 }
 
 #[test]
@@ -216,23 +223,27 @@ fn render_png_writes_every_state() {
 #[test]
 fn first_instance_runs_writes_config_and_stops_on_sigterm() {
     let sb = Sandbox::new("run");
+    // Logs go to a file, so the test can wait for the retry state before signalling.
+    let log = sb.path("stderr.log");
     let mut child = sb
         .command(&["--verbose"])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
         .spawn()
         .unwrap();
 
-    // Wait until the lock file has the PID and the config has been written.
     let lock = sb.path("run/frame-vocal-pitch.lock");
     let config = sb.path("config/frame-vocal-pitch/config.toml");
     let deadline = Instant::now() + Duration::from_secs(10);
+    // Wait until the lock file has the PID, the config exists and one retry was logged.
     while Instant::now() < deadline {
-        if config.is_file()
-            && fs::read_to_string(&lock)
-                .map(|pid| pid.trim() == child.id().to_string())
-                .unwrap_or(false)
-        {
+        let owned = fs::read_to_string(&lock)
+            .map(|pid| pid.trim() == child.id().to_string())
+            .unwrap_or(false);
+        let logged = fs::read_to_string(&log)
+            .map(|text| text.contains("SteamVR unavailable") || text.contains("SteamVR is not running"))
+            .unwrap_or(false);
+        if owned && config.is_file() && logged {
             break;
         }
         assert!(
@@ -244,21 +255,11 @@ fn first_instance_runs_writes_config_and_stops_on_sigterm() {
     assert!(config.is_file(), "no config written");
     assert!(fs::read_to_string(&config).unwrap().contains("[hud]"));
 
-    // The retry state must be logged and SteamVR must not be launched by us.
     let started = Instant::now();
     signal(&child, Signal::SIGTERM);
     let status = child.wait().unwrap();
     let stopped = started.elapsed();
-    let mut stderr = String::new();
-    {
-        use std::io::Read;
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-    }
+    let stderr = fs::read_to_string(&log).unwrap();
     assert_eq!(status.code(), Some(0), "{stderr}");
     assert!(stopped < Duration::from_secs(2), "shutdown took {stopped:?}");
     assert!(

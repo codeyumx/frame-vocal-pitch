@@ -22,15 +22,16 @@ use fvp_openvr::{
     cross, dot, is_steamvr_running, normalize, sub, ControllerRole, Event, FrameRef, InputMethod,
     Mat34, MouseButton, OverlayFlag, OverlayHandle, TextureSubmitter, Vr, HMD_INDEX,
 };
-use fvp_pitch::{Class, PitchState};
+use fvp_pitch::{Class, PitchState, ResonanceState};
 use fvp_ui::{
-    hud_overlay_width_m, vocal_rest_toast, Action, Hud, HudState, HudView, LiveInfo, SettingsPanel,
-    SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
+    hud_overlay_width_m, vocal_rest_toast, Action, CalibStatus, CalibWhich, Hud, HudState, HudView,
+    LiveInfo, ResonanceLive, ResonanceView, SettingsPanel, SETTINGS_HEIGHT_PX, SETTINGS_WIDTH_PX,
+    STRINGS,
 };
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
-use crate::analysis::{self, Analysis, Control};
+use crate::analysis::{self, Analysis, CalibUpdate, Control};
 use crate::{autostart, exit, instance, signals, VERSION_LINE};
 
 /// Overlay key of the HUD (SPEC §4.1).
@@ -121,6 +122,10 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
         control_paused: false,
         state: HudState::NoVoice,
         f0_hz: None,
+        resonance: None,
+        calibration: None,
+        calib_relaxed: CalibStatus::NotRecorded,
+        calib_target: CalibStatus::NotRecorded,
         toast: None,
         controller: None,
         controller_at: Instant::now(),
@@ -191,6 +196,12 @@ struct App {
     control_paused: bool,
     state: HudState,
     f0_hz: Option<f32>,
+    /// Latest resonance state published by the analysis thread (§5.1).
+    resonance: Option<ResonanceState>,
+    /// Calibration recording asked for and not yet finished.
+    calibration: Option<CalibWhich>,
+    calib_relaxed: CalibStatus,
+    calib_target: CalibStatus,
     toast: Option<(String, Instant)>,
     /// Wrist controller resolved for the current placement.
     controller: Option<(ControllerRole, u32)>,
@@ -239,6 +250,11 @@ impl App {
             if snapshot.reminder_due {
                 self.play_tone();
             }
+            self.resonance = snapshot.resonance;
+            if let Some(update) = snapshot.calib {
+                self.on_calib(update);
+            }
+            self.guard_calibration(now);
 
             if self.session.is_none() && now >= self.retry_at {
                 self.connect(now);
@@ -252,11 +268,7 @@ impl App {
                 self.update_state(now, snapshot.state);
             }
             self.analysis.set_live(self.live());
-            let paused = self.paused();
-            if paused != self.control_paused {
-                self.control_paused = paused;
-                self.refresh_control();
-            }
+            self.sync_paused();
 
             if self.quit {
                 log::info!("quit requested from the dashboard");
@@ -323,7 +335,13 @@ impl App {
     /// Applies the current configuration to the subsystems that cache it.
     fn apply_config(&mut self) {
         self.capture.set_mode(mic_mode(self.cfg.audio.mic_mode));
-        self.control_paused = self.paused();
+        // SPEC §5.1: a calibration needs the indicator on and the bypass path.
+        if self.calibration.is_some()
+            && (!self.cfg.resonance.enabled || self.active_mic_mode() != MicMode::Bypass)
+        {
+            self.abort_calibration();
+        }
+        self.sync_paused();
         self.refresh_control();
         self.sync_tone();
     }
@@ -336,13 +354,25 @@ impl App {
         ));
     }
 
-    /// No overlay shows pitch and the vocal-rest timer is off (SPEC §4.1).
+    /// Nothing visible needs pitch and no other feature is waiting for it (SPEC §4.1, §5.1).
     fn paused(&self) -> bool {
         let showing = self
             .session
             .as_ref()
             .is_some_and(|session| session.shown || session.dashboard_active);
-        !(showing || self.cfg.vocal_rest.minutes > 0)
+        !(showing
+            || self.cfg.vocal_rest.minutes > 0
+            || self.cfg.resonance.enabled
+            || self.calibration.is_some())
+    }
+
+    /// Pushes the pause state to the analysis thread if it changed.
+    fn sync_paused(&mut self) {
+        let paused = self.paused();
+        if paused != self.control_paused {
+            self.control_paused = paused;
+            self.refresh_control();
+        }
     }
 
     fn poll_config(&mut self, now: Instant) {
@@ -392,11 +422,22 @@ impl App {
         self.status = Some(status);
     }
 
+    /// Capture has been unhealthy for long enough to call it a missing microphone.
+    fn no_mic(&self, now: Instant) -> bool {
+        self.unhealthy_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= NO_MIC_AFTER)
+    }
+
+    /// Active (not requested) mic mode; before the first status poll, assume the configured one.
+    fn active_mic_mode(&self) -> MicMode {
+        self.status
+            .as_ref()
+            .map_or_else(|| mic_mode(self.cfg.audio.mic_mode), |status| status.active)
+    }
+
     /// Maps capture state and the newest pitch state onto the HUD state (SPEC §4.1).
     fn update_state(&mut self, now: Instant, pitch: Option<PitchState>) {
-        let no_mic = self
-            .unhealthy_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= NO_MIC_AFTER);
+        let no_mic = self.no_mic(now);
         let (state, f0) = if self.muted {
             (HudState::Muted, None)
         } else if no_mic {
@@ -416,6 +457,119 @@ impl App {
         };
         self.state = state;
         self.f0_hz = f0.filter(|hz| hz.is_finite());
+    }
+
+    // ---- Resonance (§5.1) ---------------------------------------------------------------
+
+    /// Indicator content for the HUD and the panel, or `None` while it is off.
+    fn resonance_view(&self) -> Option<ResonanceView> {
+        resonance_view(
+            self.cfg.resonance.enabled,
+            self.active_mic_mode(),
+            self.cfg.resonance.relaxed_df_hz,
+            self.cfg.resonance.target_df_hz,
+            self.resonance,
+        )
+    }
+
+    fn set_calib_status(&mut self, which: CalibWhich, status: CalibStatus) {
+        match which {
+            CalibWhich::Relaxed => self.calib_relaxed = status,
+            CalibWhich::Target => self.calib_target = status,
+        }
+        self.panel.invalidate();
+    }
+
+    /// Begins a 10 s calibration recording (§5.1).
+    fn start_calibration(&mut self, which: CalibWhich) {
+        if self.calibration.is_some() {
+            log::debug!("a calibration is already recording");
+            return;
+        }
+        if !self.cfg.resonance.enabled {
+            log::debug!("resonance is off; calibration not started");
+            return;
+        }
+        if self.resonance_view() == Some(ResonanceView::NeedsBypass) {
+            log::warn!("resonance needs the bypass mic mode; calibration not started");
+            return;
+        }
+        if self.muted {
+            self.set_calib_status(which, CalibStatus::Failed(STRINGS.state_muted.to_owned()));
+            return;
+        }
+        if self.no_mic(Instant::now()) {
+            self.set_calib_status(which, CalibStatus::Failed(STRINGS.state_no_mic.to_owned()));
+            return;
+        }
+        self.calibration = Some(which);
+        self.set_calib_status(which, CalibStatus::Recording { progress: 0.0 });
+        self.analysis.start_calibration(which);
+        self.sync_paused();
+        log::info!("recording the {which:?} resonance calibration");
+    }
+
+    /// Drops a running recording without a message.
+    fn abort_calibration(&mut self) {
+        if self.calibration.take().is_some() {
+            log::info!("resonance calibration aborted");
+            self.analysis.abort_calibration();
+            self.calib_relaxed = CalibStatus::NotRecorded;
+            self.calib_target = CalibStatus::NotRecorded;
+            self.panel.invalidate();
+            self.sync_paused();
+        }
+    }
+
+    /// Drops a running recording and shows `message`.
+    fn fail_calibration(&mut self, which: CalibWhich, message: String) {
+        log::warn!("resonance calibration stopped: {message}");
+        self.analysis.fail_calibration(message.clone());
+        self.calibration = None;
+        self.set_calib_status(which, CalibStatus::Failed(message));
+        self.sync_paused();
+    }
+
+    /// Stops a recording that became impossible since it started (§5.1).
+    fn guard_calibration(&mut self, now: Instant) {
+        let Some(which) = self.calibration else {
+            return;
+        };
+        if self.active_mic_mode() != MicMode::Bypass {
+            self.abort_calibration();
+        } else if self.muted {
+            self.fail_calibration(which, STRINGS.state_muted.to_owned());
+        } else if self.no_mic(now) {
+            self.fail_calibration(which, STRINGS.state_no_mic.to_owned());
+        }
+    }
+
+    /// Progress and results reported by the analysis thread.
+    fn on_calib(&mut self, update: CalibUpdate) {
+        match update {
+            CalibUpdate::Progress { which, progress } => {
+                // Ignore progress of a recording this loop already dropped.
+                if self.calibration == Some(which) {
+                    self.set_calib_status(which, CalibStatus::Recording { progress });
+                }
+            }
+            CalibUpdate::Done { which, df_hz } => {
+                self.calibration = None;
+                self.set_calib_status(which, CalibStatus::Done { df_hz });
+                apply_calibration(&mut self.cfg, which, df_hz);
+                if let Err(e) = self.watcher.save(&self.cfg) {
+                    log::warn!("cannot save the calibration: {e}");
+                }
+                self.apply_config();
+                log::info!("resonance calibration {which:?}: {df_hz:.0} Hz");
+            }
+            CalibUpdate::Failed { which, message } => {
+                self.calibration = None;
+                self.set_calib_status(which, CalibStatus::Failed(message.clone()));
+                self.sync_paused();
+                log::warn!("resonance calibration {which:?} failed: {message}");
+            }
+        }
     }
 
     // ---- Reminder tone ------------------------------------------------------------------
@@ -638,6 +792,7 @@ impl App {
                 }
                 self.panel.invalidate();
             }
+            Action::StartCalibration(which) => self.start_calibration(which),
             Action::Quit => self.quit = true,
         }
     }
@@ -671,6 +826,7 @@ impl App {
 
     fn drive_hud(&mut self, now: Instant) {
         let placement = self.cfg.hud.placement;
+        let resonance = self.resonance_view();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -761,6 +917,8 @@ impl App {
                 .as_ref()
                 .filter(|(_, until)| now < *until)
                 .map(|(text, _)| text.clone()),
+            // Only carried while the indicator is on; the HUD ignores it in colour mode.
+            resonance,
         };
         if let Some(frame) = self.hud.render(&view, now) {
             let frame = FrameRef {
@@ -776,6 +934,11 @@ impl App {
     }
 
     fn drive_dashboard(&mut self) {
+        let resonance = ResonanceLive {
+            position: self.resonance_view(),
+            relaxed: self.calib_relaxed.clone(),
+            target: self.calib_target.clone(),
+        };
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -797,6 +960,7 @@ impl App {
             state: self.state,
             mic_status_line: status_line(self.status.as_ref()),
             autostart: self.autostart_enabled,
+            resonance,
         };
         if let Some(frame) = self.panel.render(&self.cfg, &live) {
             let frame = FrameRef {
@@ -914,6 +1078,44 @@ fn status_line(status: Option<&CaptureStatus>) -> String {
     parts.join(" \u{00b7} ")
 }
 
+/// Indicator content for a configuration, mic mode and tracker state (SPEC §5.1).
+///
+/// Resonance needs the bypass path (Valve's EQ changes the spectrum), both calibration
+/// recordings and a reading; anything missing maps to the corresponding message. The
+/// returned value never influences the tile colour or the reminder.
+fn resonance_view(
+    enabled: bool,
+    active: MicMode,
+    relaxed_df_hz: Option<f32>,
+    target_df_hz: Option<f32>,
+    state: Option<ResonanceState>,
+) -> Option<ResonanceView> {
+    if !enabled {
+        return None;
+    }
+    if active == MicMode::Processed {
+        return Some(ResonanceView::NeedsBypass);
+    }
+    if relaxed_df_hz.is_none() || target_df_hz.is_none() {
+        return Some(ResonanceView::Uncalibrated);
+    }
+    Some(match state {
+        Some(ResonanceState::Position(p)) => ResonanceView::Position(p),
+        Some(ResonanceState::TooSimilar) => ResonanceView::TooSimilar,
+        Some(ResonanceState::Uncalibrated) => ResonanceView::Uncalibrated,
+        Some(ResonanceState::Gathering) | None => ResonanceView::Gathering,
+    })
+}
+
+/// Stores a calibration result in the configuration (§5.1, §6.1).
+fn apply_calibration(cfg: &mut Config, which: CalibWhich, df_hz: f32) {
+    match which {
+        CalibWhich::Relaxed => cfg.resonance.relaxed_df_hz = Some(df_hz),
+        CalibWhich::Target => cfg.resonance.target_df_hz = Some(df_hz),
+    }
+    cfg.clamp();
+}
+
 /// 256 px dashboard icon: the installed hicolor icon, then one next to the executable.
 fn icon_path() -> Option<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
@@ -1017,5 +1219,76 @@ mod tests {
         assert!((fade_for_degrees(67.5) - 0.5).abs() < 1e-6);
         assert_eq!(fade_for_degrees(FADE_END_DEG), 0.0);
         assert_eq!(fade_for_degrees(120.0), 0.0);
+    }
+
+    #[test]
+    fn resonance_view_needs_bypass_both_calibrations_and_a_reading() {
+        let (relaxed, target) = (Some(1000.0f32), Some(1200.0f32));
+        let position = Some(ResonanceState::Position(0.5));
+        assert_eq!(
+            resonance_view(false, MicMode::Bypass, relaxed, target, position),
+            None,
+            "off means nothing on the HUD"
+        );
+        assert_eq!(
+            resonance_view(true, MicMode::Processed, relaxed, target, position),
+            Some(ResonanceView::NeedsBypass),
+            "Valve's EQ changes the spectrum (§5.1)"
+        );
+        assert_eq!(
+            resonance_view(true, MicMode::Bypass, None, target, position),
+            Some(ResonanceView::Uncalibrated)
+        );
+        assert_eq!(
+            resonance_view(true, MicMode::Bypass, relaxed, None, None),
+            Some(ResonanceView::Uncalibrated)
+        );
+        assert_eq!(
+            resonance_view(true, MicMode::Bypass, relaxed, target, None),
+            Some(ResonanceView::Gathering)
+        );
+        assert_eq!(
+            resonance_view(
+                true,
+                MicMode::Bypass,
+                relaxed,
+                target,
+                Some(ResonanceState::TooSimilar)
+            ),
+            Some(ResonanceView::TooSimilar)
+        );
+        assert_eq!(
+            resonance_view(true, MicMode::Bypass, relaxed, target, position),
+            Some(ResonanceView::Position(0.5))
+        );
+    }
+
+    #[test]
+    fn calibration_result_survives_a_config_round_trip() {
+        let dir = std::env::temp_dir().join(format!("fvp-calib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        apply_calibration(&mut cfg, CalibWhich::Relaxed, 1012.0);
+        apply_calibration(&mut cfg, CalibWhich::Target, 1187.5);
+        fvp_config::save(&cfg, &path).unwrap();
+
+        let reloaded = fvp_config::load_or_init(&path);
+        assert_eq!(reloaded.resonance.relaxed_df_hz, Some(1012.0));
+        assert_eq!(reloaded.resonance.target_df_hz, Some(1187.5));
+        assert_eq!(
+            resonance_view(
+                true,
+                MicMode::Bypass,
+                reloaded.resonance.relaxed_df_hz,
+                reloaded.resonance.target_df_hz,
+                Some(ResonanceState::Position(1.0))
+            ),
+            Some(ResonanceView::Position(1.0))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

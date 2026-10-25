@@ -18,7 +18,8 @@ This document is the only input for implementation. See [Clean-room rules](#clea
 
 ### Non-goals (v1)
 - Desktop/PC version, Windows support, streaming-mode (PC SteamVR) support.
-- Teaching voice technique, resonance/formant analysis, recording sessions to disk.
+- Teaching voice technique, recording sessions to disk, judging how a voice will be perceived.
+  Resonance feedback exists only as the opt-in, self-calibrated, experimental indicator of §5.1.
 - Push-to-talk key emulation (there is no local voice-chat client to drive on the headset).
 - Changing the Frame's **system-wide** audio setup: WirePlumber/PipeWire config files, the `filters`
   metadata, default devices, ALSA mixer. The processing bypass in §6.3 affects this app's input only.
@@ -142,7 +143,9 @@ Placement modes (setting `placement`):
 Content (setting `display`):
 - `color` (default): a rounded tile filled with the state colour.
 - `detailed`: the tile plus a vertical range bar (detection span, target band highlighted, marker at
-  current F0) and the current F0 as text (`182 Hz`), or `—` when unvoiced.
+  current F0) and the current F0 as text (`182 Hz`), or `—` when unvoiced. When resonance feedback
+  (§5.1) is on, a second thin bar to the right of the range bar shows the brightness marker; it never
+  changes the tile colour. In `color` mode resonance is not shown.
 
 States and default colours:
 
@@ -180,6 +183,10 @@ Controls (each writes the config file immediately):
 - Mic input: **"Bypass Valve processing (this app only)"** (default) / "Use processed mic". Below it a
   status line (§6.3) naming the node actually recorded from and any fallback reason.
 - Quit (exits with status 3 so the service does not restart it).
+- Resonance (experimental), §5.1: off by default. Turning it on first shows the explanation card
+  (§5.1 "User guidance") with "Turn on" / "Keep off". When on: "Record relaxed voice (10 s)",
+  "Record target voice (10 s)" with progress and result, the current position as text, and a
+  "How this works" button that re-opens the card.
 
 Text strings live in one table; English required, layout must tolerate 30 % longer strings.
 
@@ -227,6 +234,65 @@ Acceptance (unit tests on synthetic 48 kHz signals):
 - Real voice: `--analyze file.wav` CLI (§8) prints a time/F0 table for manual checking.
 - CPU budget: analysis < 2 % of one core on the Frame (measure with `--bench`).
 
+### 5.1 Resonance feedback (experimental, opt-in)
+Purpose: show whether the user's voice is drifting **darker or brighter relative to their own two
+calibration recordings**. It is not a verdict on how the voice sounds to others, has no "in range"
+state, never changes the tile colour and never triggers the reminder tone.
+
+Measurement (on the 16 kHz signal the pitch path already produces):
+- Frames of 25 ms every 10 ms, only on hops the pitch path marks voiced with F0 ≤ 300 Hz (above that,
+  harmonics are too sparse for reliable formant estimates; such hops are skipped).
+- Pre-emphasis 0.97, Hamming window, linear prediction (autocorrelation method, Levinson–Durbin),
+  order 16. Formants F1–F3 = the three lowest resonances of the LPC model between 200 and 4000 Hz with
+  bandwidth < 500 Hz, found by polynomial roots or by peak-picking the LPC envelope on a ≤ 10 Hz grid.
+  Frames without three valid formants are skipped.
+- Per-frame metric: formant spacing ΔF from the uniform-tube model Fi = (2i − 1)·ΔF/2, least-squares
+  over i = 1..3: ΔF = Σ Fi·(2i−1)/2 ÷ Σ ((2i−1)/2)². Higher ΔF = brighter.
+- Displayed value R = median ΔF over the voiced frames of the last 8 s (`resonance.window_s`).
+  Needs ≥ 2 s of accepted frames in the window; otherwise state "gathering" (marker hidden, bar dim).
+- Only in bypass mode (§6.3). When the active mic mode is processed, show "Resonance needs the
+  bypass mic mode" and hide the marker: Valve's EQ changes the spectrum.
+
+Calibration:
+- "Record relaxed voice" / "Record target voice": 10 s each; the value stored is the median ΔF of the
+  accepted frames. Fails with a clear message if fewer than 3 s of frames were accepted ("Not enough
+  clear speech — try again in a quiet place, speaking normally").
+- If |target − relaxed| < 5 % of relaxed: store both, but show "These two recordings are too similar
+  to tell apart; the indicator will not be useful" and keep the marker hidden.
+- Position p = (R − relaxed) / (target − relaxed), shown clamped to −0.25…1.25 on the bar with ticks
+  at 0 ("relaxed") and 1 ("target"). Text: "Brightness: near relaxed / between / near target /
+  beyond target". Changes in p are smoothed (EMA, 1 s time constant); the marker moves slowly by design.
+- Without both calibrations the bar shows "Calibrate in settings".
+
+User guidance (the explanation card; text in the string table, plain language, ≤ 120 words visible
+without scrolling, rest scrollable):
+- What it is: an estimate of how bright or dark your voice sounds, compared with your own two
+  recordings. It moves slowly and is rough.
+- When it may not help — **turn it off if any of these apply or if it does not match what you hear
+  or what people you trust tell you**:
+  - You speak a different language or accent in VR than in your calibration, or switch often
+    (vowels differ between languages and accents, and they move the estimate). Recalibrate in the
+    language you are using.
+  - Whispering, singing, shouting, very high pitch (above ~300 Hz it cannot measure), or a noisy room.
+  - Your goal is not about how bright or dark your voice sounds.
+  - Watching it makes you tense or self-conscious.
+- It cannot tell you how others perceive your voice. A voice coach or a trusted listener can.
+- Pitch feedback works the same with the indicator on or off.
+
+Acceptance (unit tests, synthetic source–filter vowels: glottal pulse train at F0 100/150/220 Hz through
+three second-order formant resonators, 48 kHz input):
+- Vowels /a/ (≈ 700/1200/2600 Hz), /i/ (≈ 300/2300/3000), /u/ (≈ 300/800/2300) with all formants scaled
+  ×1.00 and ×1.15: R averaged over a 3-vowel mix rises by 15 % ± 4 %.
+- Per-vowel formant estimates within ±8 % of the resonator frequencies at F0 100 and 150 Hz. At
+  F0 220 Hz only F3 (and /a/'s F1–F3) must be within ±8 %; low F1/F2 of /i/ and /u/ are biased toward
+  the harmonics (known limitation of autocorrelation LPC at high F0) — the test records the measured
+  deviation instead of asserting it. The R scaling test above is the binding requirement at all F0s.
+- F0 = 350 Hz input, noise and silence → no accepted frames.
+- Calibration: fewer than 3 s accepted → error; < 5 % apart → "too similar" state; p = 0 at relaxed,
+  1 at target, clamped display.
+- Processed mic mode → indicator unavailable state.
+- CPU: pitch + resonance together < 3 % of one core on the Frame (`--bench` prints both).
+
 ---
 
 ## 6. Configuration and runtime
@@ -260,6 +326,9 @@ strings → default and a log line):
 | `audio.mic_mode` | string | `"bypass"` | `bypass`, `processed` (§6.3) |
 | `audio.detect_min_hz`, `audio.detect_max_hz` | float | 60, 500 | 40–1000, min ≤ max − 50 |
 | `audio.noise_floor_min_dbfs` | float | −60 | −90 to −20; lower clamp of the adaptive noise floor (§5) |
+| `resonance.enabled` | bool | `false` | §5.1; set only after the explanation card was acknowledged |
+| `resonance.window_s` | float | 8 | 4–20 |
+| `resonance.relaxed_df_hz`, `resonance.target_df_hz` | float or absent | absent | calibration results (§5.1); absent = not calibrated |
 
 Autostart is not a config key: it is the enabled state of the systemd user unit (§7).
 

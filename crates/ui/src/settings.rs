@@ -1,4 +1,5 @@
-//! Dashboard settings panel (§4.2), 1200 × 800 px.
+//! Dashboard settings panel (§4.2), 1200 × 800 px, with two pages chosen by tabs in the header
+//! ("General" and "Resonance (experimental)", §5.1) and the modal resonance explanation card.
 //!
 //! Coordinates passed to [`SettingsPanel::pointer_move`] and [`SettingsPanel::click`] are panel
 //! pixels with the origin at the **top-left** corner (OpenVR mouse events use a bottom-left
@@ -8,7 +9,7 @@ use fvp_config::{Config, DisplayMode, MicMode, Placement, Preset, CUSTOM_MIN_GAP
 use tiny_skia::{Color, Pixmap};
 
 use crate::draw::{self, Rgba, R};
-use crate::hud::HudState;
+use crate::hud::{HudState, ResonanceView};
 use crate::strings::{fill_v, STRINGS};
 use crate::text::{Align, TextRenderer, Weight};
 use crate::Frame;
@@ -39,7 +40,37 @@ pub mod steps {
     pub const BAND_LARGE_HZ: f32 = 10.0;
 }
 
-/// Live data shown in the panel (live strip, mic status line, autostart state).
+/// Which calibration recording (§5.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum CalibWhich {
+    Relaxed,
+    Target,
+}
+
+/// State of one calibration recording (§5.1).
+#[derive(Clone, PartialEq, Debug, Default)]
+pub enum CalibStatus {
+    /// Not recorded in this session; the panel shows the value stored in the config, if any.
+    #[default]
+    NotRecorded,
+    /// Recording in progress; `progress` runs from 0 to 1 over the 10 s.
+    Recording { progress: f32 },
+    /// Finished: median formant spacing ΔF of the accepted frames.
+    Done { df_hz: f32 },
+    /// Failed; the message is shown as is (e.g. [`crate::Strings::calib_not_enough_speech`]).
+    Failed(String),
+}
+
+/// Live resonance data for the settings panel.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ResonanceLive {
+    /// Current indicator state; `None` while resonance feedback is off.
+    pub position: Option<ResonanceView>,
+    pub relaxed: CalibStatus,
+    pub target: CalibStatus,
+}
+
+/// Live data shown in the panel (live strip, mic status line, autostart state, resonance).
 #[derive(Clone, PartialEq, Debug)]
 pub struct LiveInfo {
     pub f0_hz: Option<f32>,
@@ -48,6 +79,7 @@ pub struct LiveInfo {
     pub mic_status_line: String,
     /// Whether the systemd user unit is enabled.
     pub autostart: bool,
+    pub resonance: ResonanceLive,
 }
 
 /// Result of a click on a control.
@@ -59,6 +91,8 @@ pub enum Action {
     SetAutostart(bool),
     /// Quit (exit status 3).
     Quit,
+    /// Start a 10 s calibration recording (§5.1).
+    StartCalibration(CalibWhich),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,6 +122,33 @@ enum Control {
     MicMode(MicMode),
     Autostart(bool),
     Quit,
+    /// Switch the panel page (panel-internal).
+    Tab(Page),
+    /// `true` opens the explanation card first; `false` turns resonance off directly.
+    ResonanceEnabled(bool),
+    /// Re-opens the explanation card (panel-internal).
+    HowItWorks,
+    Record(CalibWhich),
+    /// Explanation card: "Turn on".
+    CardTurnOn,
+    /// Explanation card: "Keep off" / "Close" (panel-internal).
+    CardClose,
+}
+
+/// Pages of the panel, chosen with the tabs in the header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Page {
+    General,
+    Resonance,
+}
+
+/// Which variant of the explanation card is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Card {
+    /// Opened by turning resonance on: "Turn on" / "Keep off".
+    Enable,
+    /// Opened by "How this works": "Close".
+    Info,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +200,10 @@ fn apply(control: Control, cfg: &Config, autostart: bool) -> Option<Action> {
     match control {
         Control::Quit => return Some(Action::Quit),
         Control::Autostart(on) => return (on != autostart).then_some(Action::SetAutostart(on)),
+        Control::Record(which) => return Some(Action::StartCalibration(which)),
+        Control::Tab(_) | Control::HowItWorks | Control::CardClose => return None,
+        Control::ResonanceEnabled(on) => c.resonance.enabled = on,
+        Control::CardTurnOn => c.resonance.enabled = true,
         Control::HudEnabled(on) => c.hud.enabled = on,
         Control::Placement(p) => c.hud.placement = p,
         Control::Display(d) => c.hud.display = d,
@@ -211,6 +276,31 @@ const STATUS_LINE_H: f32 = 22.0;
 const STATUS_LINES: usize = 3;
 /// Scroll distance per unit of `scroll(dy)`.
 const SCROLL_STEP_PX: f32 = 60.0;
+/// Left edge of the page tabs in the header.
+const TABS_X: f32 = 290.0;
+
+// Resonance page.
+const RES_INTRO_LINES: usize = 5;
+const RES_INTRO_LINE_H: f32 = 24.0;
+const RES_NOW_H: f32 = 30.0;
+const RES_POS_LINES: usize = 3;
+const RES_POS_LINE_H: f32 = 30.0;
+const CALIB_BTN_H: f32 = 46.0;
+const CALIB_STATUS_H: f32 = 60.0;
+const CALIB_HINT_LINES: usize = 4;
+/// Length of a calibration recording (§5.1), for the "s left" readout.
+const CALIBRATION_S: f32 = 10.0;
+
+// Explanation card (modal over the whole panel).
+const CARD_R: R = R::new(150.0, 96.0, 900.0, 608.0);
+/// Scrollable text viewport inside the card.
+const CARD_TEXT: R = R::new(CARD_R.x + 44.0, CARD_R.y + 92.0, CARD_R.w - 100.0, 400.0);
+const CARD_TEXT_PX: f32 = 25.0;
+const CARD_LINE_H: f32 = 36.0;
+const CARD_PARA_GAP: f32 = 16.0;
+const CARD_BULLET_GAP: f32 = 8.0;
+const CARD_BULLET_INDENT: f32 = 30.0;
+const CARD_BTN: (f32, f32) = (220.0, 56.0);
 
 const BG: Rgba = Rgba::hex(0x12151A, 255);
 const CARD: Rgba = Rgba::hex(0x1C2028, 255);
@@ -222,17 +312,24 @@ const ACCENT: Rgba = Rgba::hex(0x3B7FE6, 255);
 const ACCENT_HOVER: Rgba = Rgba::hex(0x5592F0, 255);
 const QUIT: Rgba = Rgba::hex(0xB83A32, 255);
 const QUIT_HOVER: Rgba = Rgba::hex(0xD04A40, 255);
+const WARN: Rgba = Rgba::hex(0xF0B860, 255);
+const SCRIM: Rgba = Rgba::hex(0x000000, 170);
 const DISABLED_ALPHA: u8 = 90;
 
 fn ctrl_rect(col_x: f32, row_y: f32) -> R {
     R::new(col_x + CTRL_DX, row_y + (ROW_H - CTRL_H) / 2.0, CTRL_W, CTRL_H)
 }
 
-/// Height of the scrollable content (from `VIEW_TOP`), used to bound scrolling.
-const fn content_height() -> f32 {
-    let left = hud_card_h() + CARD_GAP + target_card_h();
-    let right = reminder_card_h() + CARD_GAP + rest_card_h() + CARD_GAP + system_card_h();
-    (if left > right { left } else { right }) + PAD
+/// Height of the scrollable content of `page` (from `VIEW_TOP`), used to bound scrolling.
+const fn content_height(page: Page) -> f32 {
+    match page {
+        Page::General => {
+            let left = hud_card_h() + CARD_GAP + target_card_h();
+            let right = reminder_card_h() + CARD_GAP + rest_card_h() + CARD_GAP + system_card_h();
+            (if left > right { left } else { right }) + PAD
+        }
+        Page::Resonance => resonance_card_h() + PAD,
+    }
 }
 const fn hud_card_h() -> f32 {
     HEAD_H + 7.0 * ROW_H + 28.0 + CARD_BOTTOM_PAD
@@ -248,6 +345,19 @@ const fn rest_card_h() -> f32 {
 }
 const fn system_card_h() -> f32 {
     HEAD_H + 2.0 * RADIO_H + STATUS_LINES as f32 * STATUS_LINE_H + 8.0 + ROW_H + CARD_BOTTOM_PAD
+}
+/// Both cards of the resonance page share this height.
+const fn resonance_card_h() -> f32 {
+    let left = HEAD_H
+        + ROW_H
+        + RES_INTRO_LINES as f32 * RES_INTRO_LINE_H
+        + 8.0
+        + ROW_H
+        + RES_NOW_H
+        + RES_POS_LINES as f32 * RES_POS_LINE_H;
+    let right = HEAD_H + 2.0 * (CALIB_BTN_H + 6.0 + CALIB_STATUS_H + 10.0)
+        + CALIB_HINT_LINES as f32 * RES_INTRO_LINE_H;
+    (if left > right { left } else { right }) + CARD_BOTTOM_PAD
 }
 
 fn fmt_num(v: f32, decimals: usize) -> String {
@@ -275,6 +385,73 @@ fn state_label(state: HudState) -> &'static str {
         HudState::Muted => STRINGS.state_muted,
         HudState::NoMic => STRINGS.state_no_mic,
     }
+}
+
+/// Settings text for the resonance indicator (§5.1). Buckets of p: < 0.25 near relaxed,
+/// < 0.75 between, ≤ 1.1 near target, above that beyond target.
+fn position_text(view: Option<ResonanceView>) -> &'static str {
+    match view {
+        None => STRINGS.no_f0,
+        Some(ResonanceView::Gathering) => STRINGS.res_gathering,
+        Some(ResonanceView::Uncalibrated) => STRINGS.res_uncalibrated,
+        Some(ResonanceView::TooSimilar) => STRINGS.res_too_similar,
+        Some(ResonanceView::NeedsBypass) => STRINGS.res_needs_bypass,
+        Some(ResonanceView::Position(p)) if !p.is_finite() => STRINGS.res_gathering,
+        Some(ResonanceView::Position(p)) if p < 0.25 => STRINGS.res_near_relaxed,
+        Some(ResonanceView::Position(p)) if p < 0.75 => STRINGS.res_between,
+        Some(ResonanceView::Position(p)) if p <= 1.1 => STRINGS.res_near_target,
+        Some(ResonanceView::Position(_)) => STRINGS.res_beyond_target,
+    }
+}
+
+/// One line of the laid-out explanation card text.
+struct CardLine<'s> {
+    /// Top of the line relative to the top of the text.
+    y: f32,
+    indent: f32,
+    weight: Weight,
+    text: &'s str,
+    /// First line of a bullet item (draw the bullet).
+    bullet: bool,
+}
+
+/// Lays out the explanation card text (§5.1 "User guidance") at [`CARD_TEXT`] width, calling
+/// `emit` per line; returns the total text height.
+fn layout_card_text(
+    tx: &mut TextRenderer,
+    wrap: &mut Vec<(usize, usize)>,
+    mut emit: impl FnMut(&mut TextRenderer, CardLine<'static>),
+) -> f32 {
+    let s = STRINGS;
+    let paragraphs = [
+        (Weight::Regular, false, s.card_what),
+        (Weight::Regular, false, s.card_others),
+        (Weight::Regular, false, s.card_pitch),
+        (Weight::SemiBold, false, s.card_turn_off),
+        (Weight::Regular, true, s.card_cases[0]),
+        (Weight::Regular, true, s.card_cases[1]),
+        (Weight::Regular, true, s.card_cases[2]),
+        (Weight::Regular, true, s.card_cases[3]),
+    ];
+    let mut y = 0.0;
+    for (i, (weight, bullet, text)) in paragraphs.into_iter().enumerate() {
+        if i > 0 {
+            y += if bullet { CARD_BULLET_GAP } else { CARD_PARA_GAP };
+        }
+        let indent = if bullet { CARD_BULLET_INDENT } else { 0.0 };
+        tx.wrap(weight, CARD_TEXT_PX, CARD_TEXT.w - indent, text, wrap);
+        for (j, &(a, b)) in wrap.iter().enumerate() {
+            let line = CardLine { y, indent, weight, text: &text[a..b], bullet: bullet && j == 0 };
+            emit(tx, line);
+            y += CARD_LINE_H;
+        }
+    }
+    y
+}
+
+/// Largest scroll offset of the explanation card text.
+fn card_scroll_max(tx: &mut TextRenderer, wrap: &mut Vec<(usize, usize)>) -> f32 {
+    (layout_card_text(tx, wrap, |_, _| {}) - CARD_TEXT.h).max(0.0)
 }
 
 /// Immediate-mode builder: draws controls and records their hit rectangles.
@@ -431,23 +608,24 @@ impl Ui<'_> {
         );
     }
 
-    /// Wrapped multi-line text in `r`, shrinking until it fits `max_lines`.
-    fn paragraph(&mut self, r: R, text: &str, max_lines: usize, line_h: f32, color: Rgba) {
+    /// Wrapped multi-line text in `r`, shrinking from `max_px` until it fits `max_lines`.
+    #[allow(clippy::too_many_arguments)]
+    fn paragraph(&mut self, r: R, text: &str, max_lines: usize, line_h: f32, max_px: f32, weight: Weight, color: Rgba) {
         let r = self.place(r);
-        let mut px = 17.0;
+        let mut px = max_px;
         loop {
-            self.tx.wrap(Weight::Regular, px, r.w, text, self.wrap);
+            self.tx.wrap(weight, px, r.w, text, self.wrap);
             if self.wrap.len() <= max_lines || px <= 13.0 {
                 break;
             }
             px -= 1.0;
         }
-        let ascent = TextRenderer::cap_height(Weight::Regular, px);
+        let ascent = TextRenderer::cap_height(weight, px);
         for (i, &(s, e)) in self.wrap.iter().take(max_lines).enumerate() {
             let base = r.y + i as f32 * line_h + (line_h + ascent) / 2.0;
             self.tx.draw(
                 self.pm,
-                Weight::Regular,
+                weight,
                 px,
                 r.x,
                 base,
@@ -460,22 +638,46 @@ impl Ui<'_> {
     }
 }
 
-/// Builds (and draws) the whole panel. Body first, then the fixed header on top of it.
-fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, scroll: f32) {
+/// Builds (and draws) the whole panel. Body first, then the fixed header on top of it, then the
+/// modal explanation card, which alone receives the pointer while open.
+fn build(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, view: ViewState) {
+    let pointer = ui.pointer;
+    if view.card.is_some() {
+        ui.pointer = None;
+    }
     ui.in_body = true;
-    ui.dy = -scroll;
-    body_left(ui, cfg);
-    body_right(ui, cfg, live);
+    ui.dy = -view.scroll_px;
+    match view.page {
+        Page::General => {
+            body_left(ui, cfg);
+            body_right(ui, cfg, live);
+        }
+        Page::Resonance => resonance_page(ui, cfg, live),
+    }
 
     ui.in_body = false;
     ui.dy = 0.0;
     draw::fill_rounded(ui.pm, R::new(0.0, 0.0, W, VIEW_TOP), 0.0, BG);
-    header(ui, cfg, live);
+    header(ui, cfg, live, view.page);
+
+    if let Some(card) = view.card {
+        ui.widgets.clear();
+        ui.pointer = pointer;
+        explanation_card(ui, card, view.card_scroll_px);
+    }
 }
 
-fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
+fn header(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo, page: Page) {
     let quit = R::new(W - M - 170.0, 14.0, 170.0, 48.0);
-    ui.text(R::new(M, 14.0, quit.x - 2.0 * M, 48.0), STRINGS.title, 32.0, Weight::SemiBold, TEXT, Align::Left);
+    ui.text(R::new(M, 14.0, TABS_X - M - 16.0, 48.0), STRINGS.title, 32.0, Weight::SemiBold, TEXT, Align::Left);
+    ui.segmented(
+        R::new(TABS_X, 14.0, quit.x - 16.0 - TABS_X, 48.0),
+        &[
+            (STRINGS.tab_general, Control::Tab(Page::General), page == Page::General),
+            (STRINGS.tab_resonance, Control::Tab(Page::Resonance), page == Page::Resonance),
+        ],
+        true,
+    );
     let hover = ui.widget(quit, Control::Quit, true);
     ui.fill(quit, 10.0, if hover { QUIT_HOVER } else { QUIT });
     ui.text(quit.inset(8.0), STRINGS.quit, 22.0, Weight::SemiBold, Rgba::hex(0xFFFFFF, 255), Align::Center);
@@ -664,6 +866,8 @@ fn body_right(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
         &live.mic_status_line,
         STATUS_LINES,
         STATUS_LINE_H,
+        17.0,
+        Weight::Regular,
         TEXT_DIM,
     );
     y += STATUS_LINES as f32 * STATUS_LINE_H + 4.0;
@@ -671,22 +875,225 @@ fn body_right(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
     ui.on_off(ctrl_rect(x, y), live.autostart, Control::Autostart);
 }
 
+/// Resonance page (§4.2, §5.1): switch, explanation and current position on the left,
+/// calibration on the right.
+fn resonance_page(ui: &mut Ui<'_>, cfg: &Config, live: &LiveInfo) {
+    let on = cfg.resonance.enabled;
+    let res = &live.resonance;
+    let h = resonance_card_h();
+    let inner = COL_W - 2.0 * PAD;
+
+    let x = LEFT_X;
+    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_resonance);
+    ui.row_label(x, y, STRINGS.res_enabled, true);
+    ui.on_off(ctrl_rect(x, y), on, Control::ResonanceEnabled);
+    y += ROW_H;
+    let intro_h = RES_INTRO_LINES as f32 * RES_INTRO_LINE_H;
+    ui.paragraph(
+        R::new(x + PAD, y, inner, intro_h),
+        STRINGS.res_intro,
+        RES_INTRO_LINES,
+        RES_INTRO_LINE_H,
+        18.0,
+        Weight::Regular,
+        TEXT_DIM,
+    );
+    y += intro_h + 8.0;
+    let how = R::new(x + PAD, y + (ROW_H - CTRL_H) / 2.0, inner, CTRL_H);
+    ui.button(how, STRINGS.res_how, Control::HowItWorks, on, false);
+    y += ROW_H;
+    ui.text(R::new(x + PAD, y, inner, RES_NOW_H), STRINGS.res_now, 18.0, Weight::Regular, TEXT_DIM, Align::Left);
+    y += RES_NOW_H;
+    let (text, weight, color) = match res.position {
+        _ if !on => (STRINGS.res_off_hint, Weight::Regular, TEXT_DIM),
+        Some(ResonanceView::Position(p)) if p.is_finite() => (position_text(res.position), Weight::SemiBold, TEXT),
+        pos => (position_text(pos), Weight::Regular, TEXT),
+    };
+    ui.paragraph(
+        R::new(x + PAD, y, inner, RES_POS_LINES as f32 * RES_POS_LINE_H),
+        text,
+        RES_POS_LINES,
+        RES_POS_LINE_H,
+        23.0,
+        weight,
+        color,
+    );
+
+    let x = RIGHT_X;
+    let mut y = ui.card(x, VIEW_TOP, h, STRINGS.section_calibration);
+    let busy = [&res.relaxed, &res.target].iter().any(|s| matches!(s, CalibStatus::Recording { .. }));
+    let can_record = on && !busy && res.position != Some(ResonanceView::NeedsBypass);
+    let calibrations = [
+        (CalibWhich::Relaxed, STRINGS.record_relaxed, &res.relaxed, cfg.resonance.relaxed_df_hz),
+        (CalibWhich::Target, STRINGS.record_target, &res.target, cfg.resonance.target_df_hz),
+    ];
+    for (which, label, status, stored) in calibrations {
+        let recording = matches!(status, CalibStatus::Recording { .. });
+        ui.button(R::new(x + PAD, y, inner, CALIB_BTN_H), label, Control::Record(which), can_record, recording);
+        y += CALIB_BTN_H + 6.0;
+        calib_status(ui, R::new(x + PAD, y, inner, CALIB_STATUS_H), status, stored, on);
+        y += CALIB_STATUS_H + 10.0;
+    }
+    ui.paragraph(
+        R::new(x + PAD, y, inner, CALIB_HINT_LINES as f32 * RES_INTRO_LINE_H),
+        STRINGS.calib_hint,
+        CALIB_HINT_LINES,
+        RES_INTRO_LINE_H,
+        18.0,
+        Weight::Regular,
+        TEXT_DIM,
+    );
+}
+
+/// Progress bar while recording, else the result, failure message or "not recorded".
+fn calib_status(ui: &mut Ui<'_>, r: R, status: &CalibStatus, stored: Option<f32>, on: bool) {
+    let fade = |c: Rgba| if on { c } else { c.with_alpha(DISABLED_ALPHA + 40) };
+    let done = |df: f32| fill_v(STRINGS.calib_done, &fmt_num(df, 0));
+    match status {
+        CalibStatus::Recording { progress } => {
+            let p = progress.clamp(0.0, 1.0);
+            let bar = R::new(r.x, r.y + 6.0, r.w, 12.0);
+            ui.fill(bar, 6.0, CTRL);
+            if p > 0.0 {
+                ui.fill(R::new(bar.x, bar.y, (bar.w * p).max(bar.h), bar.h), 6.0, ACCENT);
+            }
+            let left = ((1.0 - p) * CALIBRATION_S).ceil() as u32;
+            let text = STRINGS.calib_recording.replace("{s}", &left.to_string());
+            ui.text(R::new(r.x, r.y + 24.0, r.w, 30.0), &text, 19.0, Weight::Regular, fade(TEXT), Align::Left);
+        }
+        CalibStatus::Failed(msg) => {
+            ui.paragraph(r, msg, 2, r.h / 2.0, 19.0, Weight::Regular, fade(WARN));
+        }
+        CalibStatus::Done { df_hz } => {
+            ui.text(R::new(r.x, r.y, r.w, 32.0), &done(*df_hz), 19.0, Weight::Regular, fade(TEXT), Align::Left);
+        }
+        CalibStatus::NotRecorded => match stored {
+            Some(df) => ui.text(R::new(r.x, r.y, r.w, 32.0), &done(df), 19.0, Weight::Regular, fade(TEXT), Align::Left),
+            None => ui.text(R::new(r.x, r.y, r.w, 32.0), STRINGS.calib_not_recorded, 19.0, Weight::Regular, fade(TEXT_DIM), Align::Left),
+        },
+    }
+}
+
+/// The modal explanation card (§5.1 "User guidance") with its scrollable text.
+fn explanation_card(ui: &mut Ui<'_>, card: Card, scroll: f32) {
+    draw::fill_rounded(ui.pm, R::new(0.0, 0.0, W, H), 0.0, SCRIM);
+    ui.fill(CARD_R, 18.0, CARD);
+    draw::stroke_rounded(ui.pm, CARD_R, 18.0, 2.0, CTRL_HOVER);
+    let title = R::new(CARD_TEXT.x, CARD_R.y + 26.0, CARD_R.w - 88.0, 48.0);
+    ui.text(title, STRINGS.card_title, 30.0, Weight::SemiBold, TEXT, Align::Left);
+
+    let clip = Some(CARD_TEXT.clip());
+    let pm = &mut *ui.pm;
+    let total = layout_card_text(ui.tx, ui.wrap, |tx, line| {
+        let top = CARD_TEXT.y + line.y - scroll;
+        if top + CARD_LINE_H <= CARD_TEXT.y || top >= CARD_TEXT.bottom() {
+            return;
+        }
+        let base = top + (CARD_LINE_H + TextRenderer::cap_height(line.weight, CARD_TEXT_PX)) / 2.0;
+        if line.bullet {
+            tx.draw(pm, Weight::SemiBold, CARD_TEXT_PX, CARD_TEXT.x + 6.0, base, Align::Left, "\u{2022}", TEXT, clip);
+        }
+        let x = CARD_TEXT.x + line.indent;
+        tx.draw(pm, line.weight, CARD_TEXT_PX, x, base, Align::Left, line.text, TEXT, clip);
+    });
+
+    let max = (total - CARD_TEXT.h).max(0.0);
+    if max > 0.0 {
+        let track = R::new(CARD_TEXT.right() + 22.0, CARD_TEXT.y, 6.0, CARD_TEXT.h);
+        ui.fill(track, 3.0, CTRL);
+        let thumb_h = (track.h * CARD_TEXT.h / total).max(40.0);
+        let thumb_y = track.y + (track.h - thumb_h) * (scroll / max).clamp(0.0, 1.0);
+        ui.fill(R::new(track.x, thumb_y, track.w, thumb_h), 3.0, TEXT_DIM);
+    }
+
+    let (bw, bh) = CARD_BTN;
+    let by = CARD_TEXT.bottom() + 28.0;
+    let right = CARD_R.right() - 44.0;
+    let primary = R::new(right - bw, by, bw, bh);
+    let mut buttons_left = primary.x;
+    match card {
+        Card::Enable => {
+            let keep_off = R::new(primary.x - 16.0 - bw, by, bw, bh);
+            ui.button(keep_off, STRINGS.card_keep_off, Control::CardClose, true, false);
+            ui.button(primary, STRINGS.card_turn_on, Control::CardTurnOn, true, true);
+            buttons_left = keep_off.x;
+        }
+        Card::Info => ui.button(primary, STRINGS.card_close, Control::CardClose, true, true),
+    }
+    if scroll < max - 0.5 {
+        let hint = R::new(CARD_TEXT.x, by, buttons_left - 24.0 - CARD_TEXT.x, bh);
+        ui.text(hint, STRINGS.card_scroll_hint, 20.0, Weight::Regular, TEXT_DIM, Align::Left);
+    }
+}
+
+/// Quantised calibration status (failure messages are compared separately).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CalibKey {
+    NotRecorded,
+    /// Percent.
+    Recording(i32),
+    Done(i32),
+    Failed,
+}
+
+impl CalibKey {
+    fn of(s: &CalibStatus) -> Self {
+        match s {
+            CalibStatus::NotRecorded => CalibKey::NotRecorded,
+            CalibStatus::Recording { progress } => CalibKey::Recording((progress.clamp(0.0, 1.0) * 100.0).round() as i32),
+            CalibStatus::Done { df_hz } => CalibKey::Done(df_hz.round() as i32),
+            CalibStatus::Failed(_) => CalibKey::Failed,
+        }
+    }
+}
+
+fn failure_message(s: &CalibStatus) -> &str {
+    match s {
+        CalibStatus::Failed(msg) => msg,
+        _ => "",
+    }
+}
+
 /// Quantised live values that influence the pixels.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct LiveKey {
     f0: Option<i32>,
     state: HudState,
     autostart: bool,
+    res_text: &'static str,
+    calib: [CalibKey; 2],
 }
 
 impl LiveKey {
     fn of(live: &LiveInfo) -> Self {
+        let res = &live.resonance;
         Self {
             f0: live.f0_hz.filter(|f| f.is_finite()).map(|f| f.round() as i32),
             state: live.state,
             autostart: live.autostart,
+            res_text: position_text(res.position),
+            calib: [CalibKey::of(&res.relaxed), CalibKey::of(&res.target)],
         }
     }
+}
+
+/// Panel-internal view state.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ViewState {
+    page: Page,
+    card: Option<Card>,
+    /// Body scroll offset of the current page.
+    scroll_px: f32,
+    /// Scroll offset of the explanation card text.
+    card_scroll_px: f32,
+}
+
+/// Everything besides the config and the strings that determines the pixels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RenderKey {
+    live: LiveKey,
+    hover: Option<usize>,
+    view: ViewState,
 }
 
 /// The dashboard settings panel.
@@ -697,12 +1104,14 @@ pub struct SettingsPanel {
     wrap: Vec<(usize, usize)>,
     pointer: Option<(f32, f32)>,
     hover: Option<usize>,
-    scroll_px: f32,
+    view: ViewState,
     cfg: Option<Config>,
     autostart: bool,
     /// What the pixels currently show; `None` forces a render.
-    last: Option<(LiveKey, Option<usize>, f32)>,
+    last: Option<RenderKey>,
     last_status: String,
+    /// Failure messages (relaxed, target) the pixels currently show.
+    last_failures: [String; 2],
     dirty: bool,
 }
 
@@ -721,11 +1130,12 @@ impl SettingsPanel {
             wrap: Vec::with_capacity(8),
             pointer: None,
             hover: None,
-            scroll_px: 0.0,
+            view: ViewState { page: Page::General, card: None, scroll_px: 0.0, card_scroll_px: 0.0 },
             cfg: None,
             autostart: false,
             last: None,
             last_status: String::new(),
+            last_failures: [String::new(), String::new()],
             dirty: true,
         }
     }
@@ -738,19 +1148,27 @@ impl SettingsPanel {
 
     /// Renders the panel; `None` when the pixels would not change.
     pub fn render(&mut self, cfg: &Config, live: &LiveInfo) -> Option<Frame<'_>> {
-        let key = (LiveKey::of(live), self.hover, self.scroll_px);
+        let key = RenderKey { live: LiveKey::of(live), hover: self.hover, view: self.view };
+        let failures = [failure_message(&live.resonance.relaxed), failure_message(&live.resonance.target)];
         let unchanged = !self.dirty
             && self.cfg.as_ref() == Some(cfg)
             && self.last.as_ref() == Some(&key)
-            && self.last_status == live.mic_status_line;
+            && self.last_status == live.mic_status_line
+            && self.last_failures[0] == failures[0]
+            && self.last_failures[1] == failures[1];
         if unchanged {
             return None;
         }
         self.dirty = false;
-        self.last = Some(key);
         if self.last_status != live.mic_status_line {
             self.last_status.clear();
             self.last_status.push_str(&live.mic_status_line);
+        }
+        for (last, now) in self.last_failures.iter_mut().zip(failures) {
+            if last != now {
+                last.clear();
+                last.push_str(now);
+            }
         }
         if self.cfg.as_ref() != Some(cfg) {
             self.cfg = Some(cfg.clone());
@@ -768,7 +1186,10 @@ impl SettingsPanel {
             dy: 0.0,
             in_body: true,
         };
-        build(&mut ui, cfg, live, self.scroll_px);
+        build(&mut ui, cfg, live, self.view);
+        // The layout may have moved under a resting pointer (page or card change).
+        self.hover = self.pointer.and_then(|(x, y)| self.hit(x, y));
+        self.last = Some(RenderKey { hover: self.hover, ..key });
         Some(Frame {
             width: SETTINGS_WIDTH_PX,
             height: SETTINGS_HEIGHT_PX,
@@ -797,8 +1218,33 @@ impl SettingsPanel {
 
     /// Click at panel pixel (x, y), top-left origin. Returns the action to perform; config edits
     /// are also applied to the panel's copy so rapid clicks accumulate before the next render.
+    /// Turning resonance on opens the explanation card; only its "Turn on" yields the
+    /// [`Action::SetConfig`].
     pub fn click(&mut self, x: f32, y: f32) -> Option<Action> {
         let control = self.widgets[self.hit(x, y)?].control;
+        let resonance_on = self.cfg.as_ref()?.resonance.enabled;
+        match control {
+            Control::Tab(page) => {
+                if page != self.view.page {
+                    self.set_view(ViewState { page, scroll_px: 0.0, ..self.view });
+                }
+                return None;
+            }
+            Control::ResonanceEnabled(true) if !resonance_on => {
+                self.open_card(Card::Enable);
+                return None;
+            }
+            Control::HowItWorks => {
+                self.open_card(Card::Info);
+                return None;
+            }
+            Control::CardClose => {
+                self.set_view(ViewState { card: None, ..self.view });
+                return None;
+            }
+            Control::CardTurnOn => self.set_view(ViewState { card: None, ..self.view }),
+            _ => {}
+        }
         let action = apply(control, self.cfg.as_ref()?, self.autostart)?;
         match &action {
             Action::SetConfig(c) => {
@@ -809,17 +1255,41 @@ impl SettingsPanel {
                 self.autostart = *on;
                 self.dirty = true;
             }
-            Action::Quit => {}
+            Action::Quit | Action::StartCalibration(_) => {}
         }
         Some(action)
     }
 
-    /// Scrolls the body; positive `dy` (wheel up / swipe down) moves towards the top.
+    /// Switches panel-internal view state. The old hit rectangles are dropped so that no click
+    /// lands on a control that is no longer shown before the next render.
+    fn set_view(&mut self, view: ViewState) {
+        self.view = view;
+        self.widgets.clear();
+        self.hover = None;
+        self.dirty = true;
+    }
+
+    /// Shows `page` with the card `card` (or none) at the top of its text; used by the previews.
+    pub(crate) fn show(&mut self, page: Page, card: Option<Card>) {
+        self.set_view(ViewState { page, card, scroll_px: 0.0, card_scroll_px: 0.0 });
+    }
+
+    fn open_card(&mut self, card: Card) {
+        self.set_view(ViewState { card: Some(card), card_scroll_px: 0.0, ..self.view });
+    }
+
+    /// Scrolls the body, or the explanation card text while the card is open; positive `dy`
+    /// (wheel up / swipe down) moves towards the top.
     pub fn scroll(&mut self, dy: f32) {
-        let max = (content_height() - (H - VIEW_TOP)).max(0.0);
-        let s = (self.scroll_px - dy * SCROLL_STEP_PX).clamp(0.0, max);
-        if s != self.scroll_px {
-            self.scroll_px = s;
+        if self.view.card.is_some() {
+            let max = card_scroll_max(&mut self.text, &mut self.wrap);
+            self.view.card_scroll_px = (self.view.card_scroll_px - dy * SCROLL_STEP_PX).clamp(0.0, max);
+            return;
+        }
+        let max = (content_height(self.view.page) - (H - VIEW_TOP)).max(0.0);
+        let s = (self.view.scroll_px - dy * SCROLL_STEP_PX).clamp(0.0, max);
+        if s != self.view.scroll_px {
+            self.view.scroll_px = s;
             if let Some((x, y)) = self.pointer {
                 self.hover = self.hit(x, y);
             }
@@ -837,6 +1307,7 @@ mod tests {
             state: HudState::InRange,
             mic_status_line: "Bypass \u{00b7} recording from Internal Microphone".into(),
             autostart: false,
+            resonance: ResonanceLive::default(),
         }
     }
 
@@ -948,8 +1419,9 @@ mod tests {
             let (x, y) = (w.rect.cx(), w.rect.cy());
             assert_eq!(panel.hit(x, y), Some(i), "{:?} overlaps another control", w.control);
         }
-        // 17 HUD (2+3+2+2+2+6), 11 target (3+4+4), 8 reminder, 2 vocal rest, 2 mic, 2 autostart, quit.
-        assert_eq!(panel.widgets.len(), 43);
+        // 2 tabs, 17 HUD (2+3+2+2+2+6), 11 target (3+4+4), 8 reminder, 2 vocal rest, 2 mic,
+        // 2 autostart, quit.
+        assert_eq!(panel.widgets.len(), 45);
     }
 
     #[test]
@@ -1093,9 +1565,248 @@ mod tests {
 
     #[test]
     fn layout_fits_without_scrolling() {
-        assert!(content_height() <= H - VIEW_TOP, "content {} > viewport", content_height());
+        for page in [Page::General, Page::Resonance] {
+            let h = content_height(page);
+            assert!(h <= H - VIEW_TOP, "{page:?}: content {h} > viewport");
+        }
         let mut panel = SettingsPanel::new();
         panel.scroll(-3.0);
-        assert_eq!(panel.scroll_px, 0.0);
+        assert_eq!(panel.view.scroll_px, 0.0);
+    }
+
+    fn on_cfg() -> Config {
+        let mut c = Config::default();
+        c.resonance.enabled = true;
+        c
+    }
+
+    fn panel_on(page: Page, cfg: &Config, live: &LiveInfo) -> SettingsPanel {
+        let mut panel = SettingsPanel::new();
+        panel.show(page, None);
+        panel.render(cfg, live).expect("first render");
+        panel
+    }
+
+    fn click(panel: &mut SettingsPanel, control: Control) -> Option<Action> {
+        let (x, y) = center_of(panel, control);
+        panel.click(x, y)
+    }
+
+    fn controls(panel: &SettingsPanel) -> Vec<Control> {
+        panel.widgets.iter().map(|w| w.control).collect()
+    }
+
+    fn is_enabled(panel: &SettingsPanel, control: Control) -> bool {
+        panel.widgets.iter().find(|w| w.control == control).unwrap_or_else(|| panel_missing(control)).enabled
+    }
+
+    #[test]
+    fn tabs_switch_pages() {
+        let cfg = Config::default();
+        let mut panel = panel_on(Page::General, &cfg, &live());
+        assert_eq!(click(&mut panel, Control::Tab(Page::Resonance)), None);
+        assert_eq!(panel.view.page, Page::Resonance);
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert!(controls(&panel).contains(&Control::ResonanceEnabled(true)));
+        assert!(!controls(&panel).contains(&Control::HudEnabled(true)));
+        assert_eq!(click(&mut panel, Control::Tab(Page::Resonance)), None, "selected tab");
+        assert!(panel.render(&cfg, &live()).is_none());
+        assert_eq!(click(&mut panel, Control::Tab(Page::General)), None);
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert!(controls(&panel).contains(&Control::HudEnabled(true)));
+    }
+
+    #[test]
+    fn resonance_controls_hit_and_produce_their_actions() {
+        let on = on_cfg();
+        let mut panel = panel_on(Page::Resonance, &on, &live());
+        let relaxed = Control::Record(CalibWhich::Relaxed);
+        let target = Control::Record(CalibWhich::Target);
+        assert_eq!(click(&mut panel, relaxed), Some(Action::StartCalibration(CalibWhich::Relaxed)));
+        assert_eq!(click(&mut panel, target), Some(Action::StartCalibration(CalibWhich::Target)));
+        assert_eq!(click(&mut panel, Control::ResonanceEnabled(true)), None, "already on");
+        assert_eq!(panel.view.card, None);
+        let mut off = on.clone();
+        off.resonance.enabled = false;
+        assert_eq!(click(&mut panel, Control::ResonanceEnabled(false)), Some(Action::SetConfig(off)));
+
+        // "How this works" re-opens the card with only "Close".
+        let mut panel = panel_on(Page::Resonance, &on, &live());
+        assert_eq!(click(&mut panel, Control::HowItWorks), None);
+        assert_eq!(panel.view.card, Some(Card::Info));
+        assert!(panel.render(&on, &live()).is_some());
+        assert_eq!(controls(&panel), [Control::CardClose]);
+        assert_eq!(click(&mut panel, Control::CardClose), None);
+        assert_eq!(panel.view.card, None);
+        assert!(panel.render(&on, &live()).is_some());
+        assert!(controls(&panel).contains(&Control::HowItWorks));
+    }
+
+    #[test]
+    fn enabling_goes_through_the_explanation_card() {
+        let cfg = Config::default();
+        let mut panel = panel_on(Page::Resonance, &cfg, &live());
+        let switch_on = center_of(&panel, Control::ResonanceEnabled(true));
+        let quit = center_of(&panel, Control::Quit);
+        assert_eq!(panel.click(switch_on.0, switch_on.1), None);
+        assert_eq!(panel.view.card, Some(Card::Enable));
+        assert_eq!(panel.click(quit.0, quit.1), None, "old controls are gone until the next render");
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert_eq!(controls(&panel), [Control::CardClose, Control::CardTurnOn]);
+        // Modal: nothing outside the card's buttons reacts.
+        assert_eq!(panel.click(switch_on.0, switch_on.1), None);
+        assert_eq!(panel.click(quit.0, quit.1), None);
+        assert_eq!(panel.view.card, Some(Card::Enable));
+
+        let mut want = cfg.clone();
+        want.resonance.enabled = true;
+        assert_eq!(click(&mut panel, Control::CardTurnOn), Some(Action::SetConfig(want.clone())));
+        assert_eq!(panel.view.card, None);
+        assert!(panel.render(&want, &live()).is_some());
+        assert!(is_enabled(&panel, Control::Record(CalibWhich::Relaxed)));
+
+        // "Keep off" emits nothing, closes the card and leaves resonance off.
+        let mut panel = panel_on(Page::Resonance, &cfg, &live());
+        assert_eq!(click(&mut panel, Control::ResonanceEnabled(true)), None);
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert_eq!(click(&mut panel, Control::CardClose), None);
+        assert_eq!(panel.view.card, None);
+        assert!(!panel.cfg.as_ref().unwrap().resonance.enabled);
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert!(controls(&panel).contains(&Control::ResonanceEnabled(true)));
+    }
+
+    #[test]
+    fn resonance_controls_are_disabled_when_off_busy_or_processed() {
+        let relaxed = Control::Record(CalibWhich::Relaxed);
+        let target = Control::Record(CalibWhich::Target);
+        let cfg = Config::default();
+        let mut panel = panel_on(Page::Resonance, &cfg, &live());
+        for c in [Control::HowItWorks, relaxed, target] {
+            assert!(!is_enabled(&panel, c), "{c:?}");
+            assert_eq!(click(&mut panel, c), None);
+        }
+        assert_eq!(panel.view.card, None);
+
+        let on = on_cfg();
+        let mut busy = live();
+        busy.resonance.relaxed = CalibStatus::Recording { progress: 0.4 };
+        let panel = panel_on(Page::Resonance, &on, &busy);
+        assert!(!is_enabled(&panel, relaxed) && !is_enabled(&panel, target));
+        assert!(is_enabled(&panel, Control::HowItWorks));
+
+        let mut processed = live();
+        processed.resonance.position = Some(ResonanceView::NeedsBypass);
+        let panel = panel_on(Page::Resonance, &on, &processed);
+        assert!(!is_enabled(&panel, relaxed) && !is_enabled(&panel, target));
+    }
+
+    #[test]
+    fn every_resonance_control_is_reachable_and_inside_the_viewport() {
+        let cases = [(on_cfg(), None, 8), (Config::default(), Some(Card::Enable), 2), (on_cfg(), Some(Card::Info), 1)];
+        for (cfg, card, count) in cases {
+            let mut panel = SettingsPanel::new();
+            panel.show(Page::Resonance, card);
+            panel.render(&cfg, &live()).unwrap();
+            assert_eq!(panel.widgets.len(), count, "{card:?}");
+            let bounds = if card.is_some() { CARD_R } else { R::new(0.0, 0.0, W, H) };
+            for (i, w) in panel.widgets.iter().enumerate() {
+                let r = w.rect;
+                assert!(r.x >= bounds.x && r.right() <= bounds.right() && r.y >= bounds.y && r.bottom() <= bounds.bottom(), "{w:?}");
+                assert_eq!(panel.hit(r.cx(), r.cy()), Some(i), "{:?} overlaps another control", w.control);
+            }
+        }
+    }
+
+    #[test]
+    fn card_shows_at_most_120_words_and_scrolls_to_the_rest() {
+        let mut tx = TextRenderer::new();
+        let mut wrap = Vec::new();
+        let (mut visible, mut total, mut turn_off_y) = (0, 0, None);
+        let height = layout_card_text(&mut tx, &mut wrap, |_, line| {
+            let words = line.text.split_whitespace().count();
+            total += words;
+            if line.y < CARD_TEXT.h {
+                visible += words;
+            }
+            if line.weight == Weight::SemiBold && turn_off_y.is_none() {
+                turn_off_y = Some(line.y);
+            }
+        });
+        assert!(visible <= 120, "{visible} words visible without scrolling");
+        assert!(total > visible && height > CARD_TEXT.h);
+        let turn_off_y = turn_off_y.expect("emphasised paragraph");
+        assert!(turn_off_y + CARD_LINE_H <= CARD_TEXT.h, "'turn it off if' starts in the first view");
+
+        let cfg = Config::default();
+        let mut panel = SettingsPanel::new();
+        panel.show(Page::Resonance, Some(Card::Enable));
+        assert!(panel.render(&cfg, &live()).is_some());
+        panel.scroll(-100.0);
+        assert_eq!(panel.view.card_scroll_px, height - CARD_TEXT.h);
+        assert!(panel.render(&cfg, &live()).is_some());
+        assert!(panel.render(&cfg, &live()).is_none());
+        panel.scroll(100.0);
+        assert_eq!(panel.view.card_scroll_px, 0.0);
+        assert_eq!(panel.view.scroll_px, 0.0, "the body does not scroll under the card");
+        // Re-opening starts at the top again.
+        panel.scroll(-1.0);
+        assert!(panel.view.card_scroll_px > 0.0);
+        panel.render(&cfg, &live()).unwrap();
+        assert_eq!(click(&mut panel, Control::CardClose), None);
+        panel.render(&cfg, &live()).unwrap();
+        let mut on = cfg.clone();
+        on.resonance.enabled = true;
+        panel.render(&on, &live()).unwrap();
+        assert_eq!(click(&mut panel, Control::HowItWorks), None);
+        assert_eq!(panel.view.card_scroll_px, 0.0);
+    }
+
+    #[test]
+    fn resonance_render_none_when_unchanged_some_on_changes() {
+        let on = on_cfg();
+        let mut panel = SettingsPanel::new();
+        panel.show(Page::Resonance, None);
+        let mut l = live();
+        l.resonance.position = Some(ResonanceView::Position(0.8));
+        assert!(panel.render(&on, &l).is_some());
+        assert!(panel.render(&on, &l).is_none());
+        l.resonance.position = Some(ResonanceView::Position(0.9));
+        assert!(panel.render(&on, &l).is_none(), "same text");
+        l.resonance.position = Some(ResonanceView::Position(1.2));
+        assert!(panel.render(&on, &l).is_some());
+        l.resonance.target = CalibStatus::Recording { progress: 0.5 };
+        assert!(panel.render(&on, &l).is_some());
+        l.resonance.target = CalibStatus::Recording { progress: 0.502 };
+        assert!(panel.render(&on, &l).is_none(), "same percent");
+        l.resonance.target = CalibStatus::Recording { progress: 0.6 };
+        assert!(panel.render(&on, &l).is_some());
+        l.resonance.target = CalibStatus::Failed("a".into());
+        assert!(panel.render(&on, &l).is_some());
+        assert!(panel.render(&on, &l).is_none());
+        l.resonance.target = CalibStatus::Failed("b".into());
+        assert!(panel.render(&on, &l).is_some());
+        l.resonance.relaxed = CalibStatus::Done { df_hz: 1000.2 };
+        assert!(panel.render(&on, &l).is_some());
+        l.resonance.relaxed = CalibStatus::Done { df_hz: 1000.4 };
+        assert!(panel.render(&on, &l).is_none(), "same displayed Hz");
+        panel.show(Page::General, None);
+        assert!(panel.render(&on, &l).is_some());
+        assert!(panel.render(&on, &l).is_none());
+    }
+
+    #[test]
+    fn position_text_follows_spec_wording() {
+        let p = |v: f32| position_text(Some(ResonanceView::Position(v)));
+        assert_eq!(p(-0.6), STRINGS.res_near_relaxed);
+        assert_eq!(p(0.0), STRINGS.res_near_relaxed);
+        assert_eq!(p(0.5), STRINGS.res_between);
+        assert_eq!(p(1.0), STRINGS.res_near_target);
+        assert_eq!(p(1.3), STRINGS.res_beyond_target);
+        assert_eq!(p(f32::NAN), STRINGS.res_gathering);
+        assert_eq!(position_text(Some(ResonanceView::Gathering)), STRINGS.res_gathering);
+        assert_eq!(position_text(Some(ResonanceView::Uncalibrated)), STRINGS.res_uncalibrated);
+        assert_eq!(position_text(Some(ResonanceView::TooSimilar)), STRINGS.res_too_similar);
+        assert_eq!(position_text(Some(ResonanceView::NeedsBypass)), STRINGS.res_needs_bypass);
     }
 }

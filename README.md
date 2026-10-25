@@ -91,11 +91,27 @@ journalctl --user -u frame-vocal-pitch -f
 
 ## Pitch is not the whole voice
 
-This app measures only pitch (how high or low your voice is). How feminine or masculine a voice
-sounds depends at least as much on **resonance** (how bright or dark it sounds), and also on
+The main indicator measures only pitch (how high or low your voice is). How feminine or masculine
+a voice sounds depends at least as much on **resonance** (how bright or dark it sounds), and also on
 intonation, weight and speech patterns. A voice can sit in the green range and still read
-differently from what you want, or sit below it and still read as intended. Use the overlay as one
-tool among others, and for resonance work use a dedicated resonance tool or a voice coach.
+differently from what you want, or sit below it and still read as intended.
+
+### Resonance indicator (experimental, off by default)
+
+On the dashboard's **Resonance (experimental)** page you can turn on a rough brightness indicator.
+Record 10 s of your relaxed voice and 10 s of your target voice; the HUD (Display: Detailed) then
+shows a slow-moving marker between "relaxed" and "target". It compares you only with your own
+recordings and needs the bypass mic mode.
+
+Turn it off if it doesn't help you, in particular if:
+- you speak a different language or accent in VR than in your recordings, or switch often (vowels
+  differ between languages and move the estimate; re-record in the language you use);
+- you whisper, sing, shout, speak above ~300 Hz, or are in a noisy room;
+- your goal isn't about how bright or dark your voice sounds;
+- watching it makes you tense, or it doesn't match what you hear or what people you trust tell you.
+
+It cannot tell you how others hear your voice; a voice coach or a trusted listener can. Details:
+[`SPEC.md` §5.1](SPEC.md#51-resonance-feedback-experimental-opt-in).
 
 ## Microphone: bypassing Valve's processing for this app only
 

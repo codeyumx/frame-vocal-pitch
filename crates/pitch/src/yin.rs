@@ -4,7 +4,7 @@
 use crate::decimate::Decimator;
 use crate::params::{
     dbfs_to_linear, PitchParams, ANALYSIS_RATE_HZ, HOP_S, NOISE_EMA_FALL_S, NOISE_EMA_RISE_S,
-    WINDOW_PERIODS,
+    RESONANCE_FRAME_S, WINDOW_PERIODS,
 };
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
@@ -26,6 +26,17 @@ pub struct Hop {
     pub rms: f32,
 }
 
+/// The newest analysis samples behind one [`Hop`] (SPEC §5.1 resonance input):
+/// 25 ms of the decimated signal ending at `Hop::t_s`. Borrowed from the
+/// detector's history, so nothing is copied or allocated.
+#[derive(Clone, Copy, Debug)]
+pub struct AnalysisFrame<'a> {
+    /// Oldest sample first.
+    pub samples: &'a [f32],
+    /// Sample rate of `samples` (16 kHz for 48 kHz input).
+    pub rate_hz: f32,
+}
+
 /// Streaming pitch detector. Feed arbitrary-sized chunks of mono samples; one
 /// [`Hop`] is produced per 10 ms of input.
 pub struct Detector {
@@ -37,8 +48,11 @@ pub struct Detector {
     hop_len: usize,
     hop_buf: Vec<f32>,
     hop_fill: usize,
-    /// Most recent `yin.frame_len` analysis samples, oldest first.
+    /// Most recent analysis samples, oldest first: the longer of the YIN frame
+    /// and the 25 ms resonance frame.
     frame: Vec<f32>,
+    /// Length of the resonance frame at the tail of `frame`.
+    resonance_len: usize,
     /// Analysis samples consumed so far (drives `Hop::t_s`).
     consumed: u64,
     yin: Yin,
@@ -59,6 +73,7 @@ impl Detector {
         let rate = input_rate_hz as f64 / factor as f64;
         let hop_len = ((rate * HOP_S).round() as usize).max(1);
         let yin = Yin::new(rate, &params);
+        let resonance_len = ((rate * RESONANCE_FRAME_S).round() as usize).max(1);
         let floor_min = dbfs_to_linear(params.noise_floor_min_dbfs);
         let alpha = |tau_s: f64| (1.0 - (-HOP_S / tau_s).exp()) as f32;
         Self {
@@ -69,7 +84,8 @@ impl Detector {
             hop_len,
             hop_buf: vec![0.0; hop_len],
             hop_fill: 0,
-            frame: vec![0.0; yin.frame_len],
+            frame: vec![0.0; yin.frame_len.max(resonance_len)],
+            resonance_len,
             consumed: 0,
             noise_ema: floor_min / params.noise_floor_factor,
             floor_min,
@@ -97,6 +113,11 @@ impl Detector {
         self.input_rate_hz
     }
 
+    /// Analysis sample rate after decimation (16 kHz for 48 kHz input).
+    pub fn analysis_rate_hz(&self) -> f32 {
+        self.rate as f32
+    }
+
     /// Current voicing RMS threshold (linear): `max(EMA × factor, clamp)`.
     pub fn noise_floor(&self) -> f32 {
         (self.noise_ema * self.params.noise_floor_factor).max(self.floor_min)
@@ -106,6 +127,12 @@ impl Detector {
     /// hop. Non-finite samples are treated as 0. Does not allocate unless
     /// `out` has to grow.
     pub fn push(&mut self, samples: &[f32], out: &mut Vec<Hop>) {
+        self.push_with(samples, |hop, _| out.push(hop));
+    }
+
+    /// Like [`Detector::push`], but hands every completed hop to `on_hop`
+    /// together with its [`AnalysisFrame`]. Never allocates.
+    pub fn push_with(&mut self, samples: &[f32], mut on_hop: impl FnMut(Hop, AnalysisFrame<'_>)) {
         for &x in samples {
             let x = if x.is_finite() { x } else { 0.0 };
             let Some(y) = self.decimator.push(x) else {
@@ -115,7 +142,15 @@ impl Detector {
             self.hop_fill += 1;
             if self.hop_fill == self.hop_len {
                 self.hop_fill = 0;
-                out.push(self.process_hop());
+                let hop = self.process_hop();
+                let n = self.frame.len();
+                on_hop(
+                    hop,
+                    AnalysisFrame {
+                        samples: &self.frame[n - self.resonance_len..],
+                        rate_hz: self.rate as f32,
+                    },
+                );
             }
         }
     }
@@ -128,10 +163,11 @@ impl Detector {
         self.consumed += hop as u64;
         let t_s = self.consumed as f64 / self.rate;
 
-        let rms = self.yin.load_energy(&self.frame);
+        let yin_frame = &self.frame[n - self.yin.frame_len..];
+        let rms = self.yin.load_energy(yin_frame);
         let floor = self.noise_floor();
         let (lag, dip) = if rms > self.floor_min {
-            self.yin.estimate(&self.frame, self.params.yin_threshold)
+            self.yin.estimate(yin_frame, self.params.yin_threshold)
         } else {
             (None, 1.0)
         };

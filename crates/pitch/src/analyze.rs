@@ -1,6 +1,7 @@
 //! Offline helpers behind the `--analyze` and `--bench` CLI modes.
 
-use crate::params::{PitchParams, INPUT_RATE_HZ};
+use crate::params::{PitchParams, INPUT_RATE_HZ, RESONANCE_WINDOW_S};
+use crate::resonance::{Calibration, ResonanceTracker};
 use crate::tracker::{Class, Tracker};
 use crate::yin::{Detector, Hop};
 use std::time::Instant;
@@ -56,6 +57,38 @@ fn run_pipeline(signal: &[f32], hops: &mut Vec<Hop>) -> usize {
         }
         count += hops.len();
     }
+    count
+}
+
+/// Measures detector + tracker + resonance cost (SPEC §5.1 CPU line) and
+/// returns the mean wall time per 10 ms hop in microseconds. The signal is a
+/// cycle of synthetic vowels /a/ /i/ /u/ at 150 Hz, so every hop is voiced
+/// below 300 Hz and runs the full formant analysis (worst case), and a
+/// calibration recorder is fed alongside as during a recording.
+pub fn bench_resonance() -> f64 {
+    let signal = synth::vowel_cycle(INPUT_RATE_HZ, BENCH_SECONDS, 150.0);
+    // Warm-up pass (page faults, caches, CPU clock ramp).
+    run_resonance_pipeline(&signal[..signal.len() / 4]);
+    let start = Instant::now();
+    let count = run_resonance_pipeline(&signal);
+    start.elapsed().as_secs_f64() * 1e6 / count.max(1) as f64
+}
+
+fn run_resonance_pipeline(signal: &[f32]) -> usize {
+    let mut detector = Detector::new(PitchParams::default(), INPUT_RATE_HZ);
+    let mut tracker = Tracker::new(165.0, 255.0);
+    let mut resonance = ResonanceTracker::new(RESONANCE_WINDOW_S);
+    let mut calibration = Calibration::new();
+    let mut count = 0;
+    for chunk in signal.chunks(BENCH_CHUNK) {
+        detector.push_with(chunk, |hop, frame| {
+            std::hint::black_box(tracker.update(&hop));
+            calibration.push(resonance.update(&hop, frame));
+            std::hint::black_box(resonance.state(Some(1000.0), Some(1200.0)));
+            count += 1;
+        });
+    }
+    std::hint::black_box(calibration.finish().ok());
     count
 }
 
@@ -123,5 +156,66 @@ pub(crate) mod synth {
             *x += 0.01 * noise.next();
         }
         v
+    }
+
+    /// Formant frequencies (Hz) of the test vowels /a/, /i/, /u/ (SPEC §5.1).
+    pub(crate) const VOWELS: [[f64; 3]; 3] = [
+        [700.0, 1200.0, 2600.0],
+        [300.0, 2300.0, 3000.0],
+        [300.0, 800.0, 2300.0],
+    ];
+    /// Resonator bandwidths (Hz) for F1, F2, F3.
+    pub(crate) const BANDWIDTHS: [f64; 3] = [80.0, 100.0, 140.0];
+
+    /// Rosenberg glottal flow pulse over one period (`p` in cycles):
+    /// raised-cosine opening over 40 %, quarter-cosine closing over 16 %,
+    /// closed for the rest.
+    fn glottal_flow(p: f64) -> f64 {
+        const OPEN: f64 = 0.40;
+        const CLOSE: f64 = 0.16;
+        if p < OPEN {
+            0.5 * (1.0 - (std::f64::consts::PI * p / OPEN).cos())
+        } else if p < OPEN + CLOSE {
+            (std::f64::consts::FRAC_PI_2 * (p - OPEN) / CLOSE).cos()
+        } else {
+            0.0
+        }
+    }
+
+    /// Source–filter vowel: glottal pulse train at `f0`, lip radiation (first
+    /// difference), then three cascaded second-order resonators (unity DC
+    /// gain) at `formants` with [`BANDWIDTHS`]. Peak-normalised to 0.5.
+    pub(crate) fn vowel(rate: u32, seconds: f64, f0: f64, formants: [f64; 3]) -> Vec<f32> {
+        let fs = rate as f64;
+        let mut v: Vec<f64> = Vec::new();
+        let mut prev = 0.0;
+        for g in tone(rate, seconds, |_| f0, glottal_flow) {
+            let g = g as f64;
+            v.push(g - prev);
+            prev = g;
+        }
+        for (f, bw) in formants.iter().zip(BANDWIDTHS) {
+            let r = (-std::f64::consts::PI * bw / fs).exp();
+            let a1 = 2.0 * r * (TAU * f / fs).cos();
+            let a2 = -r * r;
+            let gain = 1.0 - a1 - a2;
+            let (mut y1, mut y2) = (0.0, 0.0);
+            for x in &mut v {
+                let y = gain * *x + a1 * y1 + a2 * y2;
+                y2 = y1;
+                y1 = y;
+                *x = y;
+            }
+        }
+        let peak = v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let scale = if peak > 0.0 { 0.5 / peak } else { 0.0 };
+        v.iter().map(|x| (x * scale) as f32).collect()
+    }
+
+    /// `seconds` of /a/ /i/ /u/ in turn, one second each, at `f0`.
+    pub(crate) fn vowel_cycle(rate: u32, seconds: usize, f0: f64) -> Vec<f32> {
+        (0..seconds)
+            .flat_map(|i| vowel(rate, 1.0, f0, VOWELS[i % VOWELS.len()]))
+            .collect()
     }
 }
