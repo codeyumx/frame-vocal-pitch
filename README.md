@@ -89,6 +89,14 @@ Logs go to the journal when it runs as a service:
 journalctl --user -u frame-vocal-pitch -f
 ```
 
+## Pitch is not the whole voice
+
+This app measures only pitch (how high or low your voice is). How feminine or masculine a voice
+sounds depends at least as much on **resonance** (how bright or dark it sounds), and also on
+intonation, weight and speech patterns. A voice can sit in the green range and still read
+differently from what you want, or sit below it and still read as intended. Use the overlay as one
+tool among others, and for resonance work use a dedicated resonance tool or a voice coach.
+
 ## Microphone: bypassing Valve's processing for this app only
 
 The Frame processes its microphone in the default path (EQ and downmix, echo cancellation with
