@@ -20,6 +20,7 @@ overlay position and the reminder tone from inside VR without a PC or a keyboard
 
 ## Install
 
+Tip: Open the desktop on Frame, navigate here with a web browser, copy this command, then use the paste button in the Konsole.
 From the headset's terminal (Developer Mode → Konsole, or `ssh`):
 
 ```sh
