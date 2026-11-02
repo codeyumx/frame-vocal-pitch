@@ -18,17 +18,16 @@ overlay position and the reminder tone from inside VR without a PC or a keyboard
 - Nothing else. The binary is self-contained; PipeWire, WirePlumber, the OpenVR runtime and the
   Vulkan loader come from the system.
 
+## Download
+
+How to download? Join the Discord and ask for the current price and download files:
+<https://discord.gg/eHAYz9wwk>
+
 ## Install
 
-Tip: Open the desktop on Frame, navigate here with a web browser, copy this command, then use the paste button in the Konsole.
-From the headset's terminal (Developer Mode → Konsole, or `ssh`):
-
-```sh
-curl -fsSL https://github.com/codeyumx/frame-vocal-pitch/releases/latest/download/install.sh | bash
-```
-
-The installer downloads the latest release, checks it against the release's `SHA256SUMS`, and
-installs it into your home directory:
+Extract the files you received on Discord and run `./install.sh` from the headset's terminal
+(Developer Mode → Konsole, or `ssh`) inside the extracted folder. It installs into your home
+directory:
 
 | What | Where |
 |---|---|
@@ -40,29 +39,8 @@ installs it into your home directory:
 | configuration | `~/.config/frame-vocal-pitch/config.toml` |
 
 It refuses to run as root, refuses to run on a non-aarch64 machine, and warns when the system does
-not look like SteamOS. Re-run the same command to update: the payload is replaced in place and the
-service is restarted if it was running.
-
-### Options
-
-```sh
-url=https://github.com/codeyumx/frame-vocal-pitch/releases/latest/download/install.sh
-
-curl -fsSL "$url" | bash -s -- --autostart           # start with SteamVR
-curl -fsSL "$url" | bash -s -- --no-autostart        # do not start with SteamVR
-curl -fsSL "$url" | bash -s -- --version             # version that would be installed
-curl -fsSL "$url" | bash -s -- --release v0.4.0      # install that release instead of the latest
-curl -fsSL "$url" | bash -s -- --uninstall           # remove, keep the configuration
-curl -fsSL "$url" | bash -s -- --uninstall --purge   # remove, including the configuration
-```
-
-The autostart choice is stored in `~/.config/frame-vocal-pitch/install-args`, so updates keep it;
-you can also flip it later in the dashboard.
-
-If you prefer not to pipe into a shell, download the tarball from the
-[releases page](https://github.com/codeyumx/frame-vocal-pitch/releases), extract it and run
-`./install.sh` from inside the extracted folder. It installs the payload next to it (`--release`
-only works when the installer is piped or run on its own).
+not look like SteamOS. Running it again replaces the install in place and restarts the service if
+it was running.
 
 ## Updates
 
@@ -171,34 +149,13 @@ The app never changes the system-wide audio configuration and never touches Valv
 ## Uninstall
 
 ```sh
-curl -fsSL https://github.com/codeyumx/frame-vocal-pitch/releases/latest/download/install.sh \
-  | bash -s -- --uninstall
+~/.local/share/frame-vocal-pitch/install.sh --uninstall
 ```
 
 That stops and disables the service, stops an instance you started by hand, and removes the
 binary, unit, dashboard entry, icons, the updater (`~/.local/share/frame-vocal-pitch/`) and the
 update cache and log (`~/.cache/frame-vocal-pitch/`). `--uninstall --purge` removes
 `~/.config/frame-vocal-pitch` as well. Nothing outside your home directory is removed.
-
-## Build from source
-
-Requires Docker for the cross-build (the headset is aarch64; the host is assumed to be x86_64).
-
-```sh
-# host-side tests (no headset needed)
-cargo test --workspace
-
-# aarch64 release binary, built in the Ubuntu 24.04 cross container
-build/build-aarch64.sh -p frame-vocal-pitch --release
-# -> target/aarch64-unknown-linux-gnu/release/frame-vocal-pitch
-
-# tarball + SHA256SUMS in dist/
-scripts/package.sh 0.1.0 target/aarch64-unknown-linux-gnu/release/frame-vocal-pitch
-```
-
-The cross container pins glibc 2.39, the same baseline as the headset's SteamOS. Releases are
-built by `.github/workflows/release.yml` on a `v*` tag; it runs the tests, cross-builds, packages
-and attaches the tarball, `SHA256SUMS` and `install.sh` to the GitHub release.
 
 ## Things this app deliberately never does
 

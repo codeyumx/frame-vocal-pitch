@@ -1,8 +1,8 @@
 name: CI
 
-# Tag push (v1.2.3): test on x86_64, cross-build the aarch64 release, package it and attach the
-# tarball, SHA256SUMS and install.sh to the GitHub release (SPEC §7 and §8).
-# Pull request / main push: host tests only.
+# Pull request / main push / tag push: host tests only.
+# The `release` job (cross-build, package, attach to a GitHub release) is kept but disabled:
+# builds are no longer published on GitHub.
 
 on:
   push:
@@ -25,7 +25,7 @@ env:
 jobs:
   test:
     name: Host tests (x86_64)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,8 +47,10 @@ jobs:
         run: cargo test --workspace --locked
 
   release:
-    name: Release (aarch64)
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Release (aarch64) — unused
+    # Disabled: builds are not published as public GitHub releases. Set back to
+    # startsWith(github.ref, 'refs/tags/v') to re-enable.
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
